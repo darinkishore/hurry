@@ -1,3 +1,10 @@
-# hypersonic
+# _hurry!_
 
-Deafeningly fast builds
+Really, really fast builds.
+
+## Usage
+
+```bash
+# Instead of `cargo build`:
+$ hurry cargo build
+```
