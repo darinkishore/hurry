@@ -176,10 +176,14 @@ pub async fn build(argv: &[String]) -> anyhow::Result<ExitStatus> {
 
         // If we can, swap in a cached invocation.
         if !cached_invocation_id_candidates.is_empty() {
-            let latest_cached_invocation_id =
-                cached_invocation_id_candidates.into_iter().max().unwrap();
+            // We swap in the earliest cached invocation, because the later
+            // build artifacts are more likely to have their mtimes mis-keyed.
+            //
+            // TODO: Explain how this happens.
+            let earliest_cached_invocation_id =
+                cached_invocation_id_candidates.into_iter().min().unwrap();
             debug!(
-                ?latest_cached_invocation_id,
+                ?earliest_cached_invocation_id,
                 "swapping in cached invocation",
             );
 
@@ -188,7 +192,7 @@ pub async fn build(argv: &[String]) -> anyhow::Result<ExitStatus> {
                 .prepare("SELECT path, mtime FROM invocation_source_file WHERE invocation_id = ?1")
                 .context("could not prepare source file mtimes query")?;
             for source_file in invocation_source_files
-                .query_map((&latest_cached_invocation_id,), |row| {
+                .query_map((&earliest_cached_invocation_id,), |row| {
                     Ok((row.get::<_, String>(0)?, row.get::<_, OffsetDateTime>(1)?))
                 })
                 .context("could not load source file mtimes")?
@@ -215,7 +219,7 @@ pub async fn build(argv: &[String]) -> anyhow::Result<ExitStatus> {
                 )
                 .context("could not prepare artifact metadata query")?;
             for artifact in invocation_artifacts
-                .query_map((&latest_cached_invocation_id,), |row| {
+                .query_map((&earliest_cached_invocation_id,), |row| {
                     Ok((
                         row.get::<_, String>(0)?,
                         row.get::<_, OffsetDateTime>(1)?,
@@ -230,7 +234,7 @@ pub async fn build(argv: &[String]) -> anyhow::Result<ExitStatus> {
                 let (path, mtime, b3sum_hex) =
                     artifact.context("could not load cached artifact metadata")?;
                 let path = workspace_cache.workspace_cache_path.join(&path);
-                debug!(?path, ?mtime, b3sum = ?b3sum_hex, "restoring cached artifact");
+                trace!(?path, ?mtime, b3sum = ?b3sum_hex, "restoring cached artifact");
 
                 if !fs::exists(&path).context("could not check restored artifact path")? {
                     fs::create_dir_all(&path.parent().unwrap())
