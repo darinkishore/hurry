@@ -45,11 +45,7 @@ Each `<workspace_path>` is the BLAKE3 hash of the absolute path to the workspace
 
 ## Branch-specific `target` caches
 
-
-
-### Future work
-
-You can imagine a version of this design that's git-agnostic, and works to restore caches whenever a previous cache could be valid.
+Our design for this is actually git-agnostic. Whenever we see a set of source files for which we have a previous cache, we restore the mtimes of every source file and then restore the build cache, so Cargo determines it doesn't need to re-run a build.
 
 Here's a sketch. When `hurry cargo build` is run:
 
