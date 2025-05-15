@@ -4,9 +4,9 @@ use std::{
     sync::LazyLock,
 };
 
-#[cfg(target_os = "linux")]
+#[cfg(target_family = "unix")]
 use std::os::unix;
-#[cfg(target_os = "windows")]
+#[cfg(target_family = "windows")]
 use std::os::windows;
 
 use anyhow::Context;
@@ -158,13 +158,13 @@ fn ensure_symlink(original: &PathBuf, link: &PathBuf) -> anyhow::Result<()> {
     Ok(())
 }
 
-#[cfg(target_os = "windows")]
+#[cfg(target_family = "windows")]
 fn symlink_dir(original: &PathBuf, link: &PathBuf) -> anyhow::Result<()> {
     windows::fs::symlink_dir(original, link)?;
     Ok(())
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(target_family = "unix")]
 fn symlink_dir(original: &PathBuf, link: &PathBuf) -> anyhow::Result<()> {
     unix::fs::symlink(original, link)?;
     Ok(())
