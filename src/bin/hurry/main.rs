@@ -19,13 +19,10 @@ enum Command {
     /// Fast `cargo` builds
     #[command(dont_delimit_trailing_values = true)]
     Cargo {
-        // #[command(subcommand)]
-        // command: Option<CargoCommand>,
         #[arg(
             num_args = ..,
             trailing_var_arg = true,
             allow_hyphen_values = true,
-            // dont_delimit_trailing_values = true,
         )]
         argv: Vec<String>,
     },

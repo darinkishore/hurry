@@ -1,6 +1,7 @@
 use std::{
     collections::HashSet,
     fs::{self, File},
+    path::{Path, PathBuf},
     process::ExitStatus,
 };
 
@@ -12,10 +13,55 @@ use walkdir::WalkDir;
 
 mod cache;
 
+struct Workspace {
+    root: PathBuf,
+    kind: WorkspaceKind,
+}
+
+enum WorkspaceKind {
+    SingleCrate,
+    MultiCrate { members: Vec<PathBuf> },
+}
+
+impl Workspace {
+    fn open<P>(dir: P) -> anyhow::Result<Self>
+    where
+        P: AsRef<Path>,
+    {
+        todo!()
+    }
+
+    fn walk_src(&self) -> impl Iterator<Item = Result<walkdir::DirEntry, walkdir::Error>> {
+        match &self.kind {
+            WorkspaceKind::SingleCrate => WalkDir::new(self.root.join("src")).into_iter(),
+            WorkspaceKind::MultiCrate { members } => members
+                .iter()
+                .map(|member| self.root.join(member).join("src"))
+                .flat_map(|src| WalkDir::new(src).into_iter()),
+        }
+    }
+}
+
 #[instrument(level = "debug")]
 pub async fn build(argv: &[String]) -> anyhow::Result<ExitStatus> {
     // Get current working directory.
     let workspace_path = std::env::current_dir().context("could not get current directory")?;
+
+    // Determine the root of the Cargo workspace, and whether it's a multi-crate
+    // workspace. Technically, the terminology here is that we are either
+    // working in a "Cargo package" or a "Cargo workspace", but in this codebase
+    // we refer to both of them as workspaces for brevity, and instead call them
+    // "single-crate" vs. "multi-crate" workspaces.
+    let mut workspace_root = workspace_path.clone();
+    loop {
+        let manifest_path = workspace_root.join("Cargo.toml");
+        if manifest_path.exists() {
+            break;
+        }
+        if !workspace_root.pop() {
+            return Err(anyhow::anyhow!("could not find Cargo.toml"));
+        }
+    }
 
     // Initialize the workspace cache.
     //
