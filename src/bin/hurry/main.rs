@@ -52,6 +52,25 @@ async fn main() {
         Command::Cargo { argv } => {
             debug!(?argv, "cargo");
 
+            // // Get the `--manifest-path` argument for `cargo {build,run}`.
+            // //
+            // // TODO: Should we do parsing this further up, and passing the flags
+            // // downwards?
+            // let mut args = std::env::args().skip_while(|val| !val.starts_with("--manifest-path"));
+            // let mut cmd = cargo_metadata::MetadataCommand::new();
+            // cmd.current_dir(dir);
+            // match args.next() {
+            //     Some(ref p) if p == "--manifest-path" => {
+            //         cmd.manifest_path(args.next().expect("--manifest-path should provide a value"));
+            //     }
+            //     Some(p) => {
+            //         cmd.manifest_path(p.trim_start_matches("--manifest-path="));
+            //     }
+            //     None => {}
+            // }
+            // let metadata = cmd.exec().context("could not get cargo metadata")?;
+            // Ok(Self { metadata });
+
             // TODO: Technically, we should parse the argv properly in case
             // this string is passed as some sort of configuration flag value.
             if argv.contains(&"build".to_string()) {

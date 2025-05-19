@@ -25,7 +25,11 @@ pub struct WorkspaceCache {
 
 impl WorkspaceCache {
     #[instrument(level = "debug")]
-    pub fn new(workspace_path: &Path) -> anyhow::Result<Self> {
+    pub fn new<P>(workspace_path: P) -> anyhow::Result<Self>
+    where
+        P: AsRef<Path>,
+        P: std::fmt::Debug,
+    {
         // Check whether the user cache exists, and create it if it
         // doesn't.
         let user_cache_path = &USER_CACHE_PATH;
@@ -46,7 +50,7 @@ impl WorkspaceCache {
         let workspace_cache_path = {
             let mut path = user_cache_path.join("workspaces");
             path.push(
-                blake3::hash(workspace_path.as_os_str().as_encoded_bytes())
+                blake3::hash(workspace_path.as_ref().as_os_str().as_encoded_bytes())
                     .to_hex()
                     .as_str(),
             );
@@ -75,7 +79,7 @@ impl WorkspaceCache {
         // and so cannot distinguish between "there is no file" and "there is a
         // file, but it's a broken symlink", which we need to handle
         // differently.
-        let target_path = workspace_path.join("target");
+        let target_path = workspace_path.as_ref().join("target");
         debug!(?target_path, "checking workspace target/");
         ensure_symlink(&target_cache_path, &target_path)
             .context("could not symlink workspace target/ to cache")?;
