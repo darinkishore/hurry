@@ -136,8 +136,9 @@ pub async fn build(argv: &[String]) -> anyhow::Result<ExitStatus> {
         s.processes()
             .iter()
             .filter(|(_pid, p)| {
-                p.exe()
-                    .map_or(false, |e| e.ends_with("rust-analyzer-proc-macro-srv"))
+                p.exe().map_or(false, |e| {
+                    e.ends_with("rust-analyzer-proc-macro-srv") || e.ends_with("rust-analyzer")
+                })
             })
             .for_each(|(_pid, p)| {
                 p.kill();
