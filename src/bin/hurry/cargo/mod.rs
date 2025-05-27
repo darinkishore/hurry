@@ -8,6 +8,7 @@ use std::{
 
 use anyhow::Context;
 use rusqlite::{OptionalExtension, Transaction};
+use sysinfo::{ProcessRefreshKind, RefreshKind, System};
 use time::OffsetDateTime;
 use tracing::{debug, debug_span, instrument, trace, trace_span};
 use walkdir::WalkDir;
@@ -124,9 +125,24 @@ pub async fn build(argv: &[String]) -> anyhow::Result<ExitStatus> {
         tx.rollback()
             .context("could not rollback cache transaction after cached build")?;
 
-        // TODO: Restoring from cache causes rust-analyzer's proc-macro server
-        // to segfault. So we kill the process here explicitly, so the whole
+        // Restoring from cache causes rust-analyzer's proc-macro server to
+        // segfault. So we kill the process here explicitly, so the whole
         // rust-analyzer restarts.
+        //
+        // FIXME: Is there a way to do this without breaking rust-analyzer?
+        let s = System::new_with_specifics(
+            RefreshKind::nothing().with_processes(ProcessRefreshKind::everything()),
+        );
+        s.processes()
+            .iter()
+            .filter(|(_pid, p)| {
+                p.exe()
+                    .map_or(false, |e| e.ends_with("rust-analyzer-proc-macro-srv"))
+            })
+            .for_each(|(_pid, p)| {
+                p.kill();
+            });
+
         return Ok(exit_status);
     }
 
