@@ -29,8 +29,8 @@ pub async fn build(argv: &[String]) -> anyhow::Result<ExitStatus> {
 
     // Initialize the workspace cache.
     //
-    // TODO: All of these failures should be non-fatal and should not block us
-    // from shelling out to `cargo build`.
+    // TODO: All of these failures should be made non-fatal and should not block
+    // the user from shelling out to `cargo`.
     let mut workspace_cache = cache::WorkspaceCache::new(&workspace.metadata.workspace_root)
         .context("could not initialize workspace cache")?;
     debug!(?workspace_cache, "initialized workspace cache");
