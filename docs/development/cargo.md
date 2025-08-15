@@ -74,32 +74,15 @@ In order for `hurry` to integrate with `cargo`/`rust`, we need to understand how
 
 ### `target/` organization
 
-TODO: Figure out the minimum version of `cargo` and `rustc` that `hurry` supports. To begin with it'll probably be whatever version uses the observed layout we're working with, but over time we may need to add support for changes made in older (or newer!) versions.
-
-> [!NOTE]
-> Source for this: [Rust compiler docs](https://doc.rust-lang.org/nightly/nightly-rustc/cargo/core/compiler/layout/index.html).
-> This documentation was written against `1.88.0` of the Rust compiler:
-> ```
-> rustup show
-> Default host: aarch64-apple-darwin
-> rustup home:  /Users/jess/.rustup
->
-> installed toolchains
-> --------------------
-> stable-aarch64-apple-darwin (default)
-> 1.88.0-aarch64-apple-darwin (active)
->
-> active toolchain
-> ----------------
-> name: 1.88.0-aarch64-apple-darwin
-> active because: overridden by environment variable RUSTUP_TOOLCHAIN
-> installed targets:
->   aarch64-apple-darwin
-> ```
-
-Some of the comments and content below have been altered from the original source to better reflect `hurry`-specific details or observed Rust compiler behavior.
+> **TODO**
+> Figure out the minimum version of `cargo` and `rustc` that `hurry` supports. To begin with it'll probably be whatever version uses the observed layout we're working with, but over time we may need to add support for changes made in older (or newer!) versions.
 
 ```
+# Source: https://doc.rust-lang.org/nightly/nightly-rustc/cargo/core/compiler/layout/index.html
+# Some of the comments and content below have been altered from the original
+# source to better reflect `hurry`-specific details or observed Rust compiler
+# behavior in rustc `1.88.0-aarch64-apple-darwin`.
+
 # This is the root directory for all output, the top-level package
 # places all of its output here.
 target/
@@ -388,14 +371,18 @@ target/
 
 ### Fresh builds
 
-TODO: What steps does `cargo` and `rustc` take to build a fresh workspace?
+> **TODO**
+> What steps does `cargo` and `rustc` take to build a fresh workspace?
 
 ### Incremental third-party builds
 
-TODO: What steps does `cargo` and `rustc` take to build incremental third-party crates?
+> **TODO**
+> What steps does `cargo` and `rustc` take to build incremental third-party crates?
 
-TODO: My understanding today is that third-party crates are not actually built incrementally in the same way that first party crates are. Instead, they're always built fully, and an "incremental" third party build is really just "some of the third party dependencies have changed since the last build" (or similar- e.g. "the local rust compiler has changed" or "the rust flags have changed" also trigger rebuilds of third party crates). Is this correct?
+> **TODO**
+> My understanding today is that third-party crates are not actually built incrementally in the same way that first party crates are. Instead, they're always built fully, and an "incremental" third party build is really just "some of the third party dependencies have changed since the last build" (or similar- e.g. "the local rust compiler has changed" or "the rust flags have changed" also trigger rebuilds of third party crates). Is this correct?
 
 ### Incremental first-party builds
 
-TODO: What steps does `cargo` and `rustc` take to build incremental first-party crates?
+> **TODO**
+> What steps does `cargo` and `rustc` take to build incremental first-party crates?
