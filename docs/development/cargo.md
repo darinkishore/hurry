@@ -12,19 +12,24 @@ When `hurry cargo build` is run:
 
 1. Compute the workspace identifier.
 2. Gather information about the workspace, used to select the appropriate cache key using the workspace cache manifest (if one exists).
-3. If an exact match cache key is found, restore its contents to the workspace.
-4. If no exact match cache key is found, restore the closest match cache key to the workspace.
-5. Run the build with `cargo`.
-6. If the build succeeds and the cache was not an exact match, store the current state of the workspace into the CAS and create a new cache key reference for this state of the repository.
 
-> [!TIP]
-> Information about the workspace is gathered from many source but in general they are something like (but not necessarily limited to):
+> [!NOTE]
+> Information about the workspace is gathered from many sources but in general they are something like (but not necessarily limited to):
 > - Platform and CPU architecture
 > - `cargo`/`rustc` version
 > - `cargo`/`rustc` invocation flags
 > - Hashed content of files on disk
 >
 > Different facts about the workspace have different levels of precedence when it comes to selecting the "most similar" cache key in the event of a non-exact match. For example, it is _almost_ useless to restore the cache for a system that is an entirely different platform and architecture. We may still do it if we detect potential reuse such as e.g. `sqlx` or other macro invocations which may actually be reused across different platforms and architectures in some contexts.
+
+3. If an exact match cache key is found, restore its contents to the workspace.
+4. If no exact match cache key is found, restore the closest match cache key to the workspace.
+
+> [!NOTE]
+> Restoring the contents to the workspace in effect means "copy the contents of the cache directory to the `target/` directory in the workspace". However, this "copy" operation is done in a few different ways; reference the "Storage" section below for more information.
+
+5. Run the build with `cargo`.
+6. If the build succeeds and the cache was not an exact match, store the current state of the workspace into the CAS and create a new cache key reference for this state of the repository.
 
 ## Storage
 
@@ -56,3 +61,341 @@ When `hurry` is run in a workspace and needs to restore the cache, its behavior 
 - If Copy-On-Write functionality is available on the file system, it prefers that.
 - If OverlayFS is available, it falls back to that in order to simulate Copy-On-Write.
 - Otherwise, it falls back to a simple symlink approach.
+
+## Native Rust builds
+
+In order for `hurry` to integrate with `cargo`/`rust`, we need to understand how their builds work. This section explains how they work to the best of our understanding. The intention is to provide multiple purposes:
+- Demonstrate to users that we actually understand how `cargo` and `rustc` work.
+  - Of course, as a corrolary, provide a place for other experts in this space to correct any misunderstandings we may have.
+  - If you're this person, we'd love to hear from you!
+- Provide a place for our core assumptions to be documented.
+  - Since this is our understanding of the baseline, all design decisions made in the product are based on this understanding.
+- Accelerate onboarding for new contributors by providing a centralized resource for learning about `cargo` and `rustc` builds.
+
+### `target/` organization
+
+TODO: Figure out the minimum version of `cargo` and `rustc` that `hurry` supports. To begin with it'll probably be whatever version uses the observed layout we're working with, but over time we may need to add support for changes made in older (or newer!) versions.
+
+> [!NOTE]
+> Source for this: [Rust compiler docs](https://doc.rust-lang.org/nightly/nightly-rustc/cargo/core/compiler/layout/index.html).
+> This documentation was written against `1.88.0` of the Rust compiler:
+> ```
+> rustup show
+> Default host: aarch64-apple-darwin
+> rustup home:  /Users/jess/.rustup
+>
+> installed toolchains
+> --------------------
+> stable-aarch64-apple-darwin (default)
+> 1.88.0-aarch64-apple-darwin (active)
+>
+> active toolchain
+> ----------------
+> name: 1.88.0-aarch64-apple-darwin
+> active because: overridden by environment variable RUSTUP_TOOLCHAIN
+> installed targets:
+>   aarch64-apple-darwin
+> ```
+
+Some of the comments and content below have been altered from the original source to better reflect `hurry`-specific details or observed Rust compiler behavior.
+
+```
+# This is the root directory for all output, the top-level package
+# places all of its output here.
+target/
+
+    # Cache of `rustc -Vv` output. Contains:
+    # - rustc version, release, name, commit hash, commit date
+    # - the host triple (e.g. `aarch64-apple-darwin`)
+    # - the llvm version
+    # - a bunch of details about the build environment, such as cpu features
+    #
+    # `hurry` will use this to hydrate the `manifest.json` file to find the
+    # closest match when a perfect cache hit isn't available.
+    #
+    # TODO: The original docs say this is "for performance";
+    # is the content reliable?
+    .rustc-info.json
+
+    # Marks the `target/` directory as a cache directory.
+    #
+    # Currently ignored by `hurry`: this seems useless; the content is
+    # actually static and set by this "Cache Directory Tagging Specification".
+    #
+    # Reference: https://bford.info/cachedir/
+    CACHEDIR.TAG
+
+    # All final artifacts are linked into this directory from `deps`.
+    # Note that named profiles will soon be included as separate directories
+    # here. They have a restricted format, similar to Rust identifiers, so
+    # Cargo-specific directories added in the future should use some prefix
+    # like `.` to avoid name collisions.
+    #
+    # For `hurry` specifically, these are the bread and butter of the actual
+    # whole `target/` directory.
+    debug/  # or release/
+
+        # File used to lock the directory to prevent multiple cargo processes
+        # from using it at the same time.
+        #
+        # It turns out that `hurry` _also_ needs to lock the directory to
+        # prevent multiple `hurry` processes from using it at the same time,
+        # and to prevent `cargo` itself from using it while `hurry` is
+        # backing up or restoring the directory. So `hurry` will actually
+        # just reuse this file as well the same way `cargo` does.
+        .cargo-lock
+
+        # Hidden directory that holds all of the fingerprint files for all
+        # packages.
+        .fingerprint/
+
+            # Each package is in a separate directory.
+            # Note that different target kinds have different filename prefixes.
+            #
+            # TODO: There are several kinds of this directory.
+            # Each shares a common `$pkgname` (e.g. `ahash`) with a unique `$META`.
+            # What are the names and conditions for these? How could we use them to cache?
+            # - Dep builds, which have the shape below
+            # - ???, which seem to be related to building the build script; contains:
+            #   - `build-script-build-script-build`
+            #   - `build-script-build-script-build.json`
+            #   - `dep-build-script-build-script-build`
+            #   - `invoked.timestamp`
+            # - ???, which seem to be related to _running_ the build script; contains:
+            #   - `run-build-script-build-script-build.json`
+            #   - `run-build-script-build-script-build`
+            #
+            # TODO: Where is `$META` coming from?
+            # TODO: Where is `$pkgname` coming from?
+            $pkgname-$META/
+                # The original docs said "_set_ of source filenames for this
+                # package", but from my observation I only see _one_ file.
+                # This is a binary, so it seems like this might be the compiled
+                # binary for this dependency?
+                #
+                # TODO: Is this actually a set of names?
+                # TODO: Is this the compiled binary of the dependency?
+                dep-lib-$targetname
+
+                # Timestamp when this package was last built.
+                #
+                # This file has no meaningful content; check the `mtime`
+                # of this file for when the dependency was last built.
+                invoked.timestamp
+
+                # The fingerprint hash.
+                #
+                # TODO: what hash function is used?
+                # TODO: what is the input to the hash function?
+                lib-$targetname
+
+                # Detailed information used for logging the reason why
+                # something is being recompiled.
+                #
+                # This contains a bunch of information about the configuration
+                # of the rust compiler at build time.
+                #
+                # TODO: How can we use this for caching/cache invalidation?
+                lib-$targetname.json
+
+            # The package shows up three times with different metadata hashes.
+            # This shape seems to be for the output of the build script.
+            $pkgname-$META/
+
+                # This contains a bunch of information about the configuration
+                # of the rust compiler at build time.
+                #
+                # TODO: How can we use this for caching/cache invalidation?
+                run-build-script-build-script-build.json
+
+                # This file appears to contain a hash.
+                # TODO: Where is this hash generated? What does it mean?
+                run-build-script-build-script-build
+
+            # The package shows up three times with different metadata hashes.
+            # This shape seems to be for the build of the build script.
+            $pkgname-$META/
+
+                # This file appears to contain a hash.
+                # TODO: Where is this hash generated? What does it mean?
+                build-script-build-script-build
+
+                # This contains a bunch of information about the configuration
+                # of the rust compiler at build time.
+                #
+                # TODO: How can we use this for caching/cache invalidation?
+                build-script-build-script-build.json
+
+                # This file appears to be an object file.
+                dep-build-script-build-script-build
+
+                # Timestamp when this package was last built.
+                #
+                # This file has no meaningful content; check the `mtime`
+                # of this file for when the dependency was last built.
+                invoked.timestamp
+
+        # This is the root directory for all rustc artifacts except build
+        # scripts, examples, and test and bench executables. Almost every
+        # artifact should have a metadata hash added to its filename to
+        # prevent collisions. One notable exception is dynamic libraries.
+        #
+        # TODO: What do we do with dynamic libraries?
+        # TODO: The original documentation explicitly stated directories,
+        # but the observed behavior is flat files in this directory. What's
+        # the deal here? When did this change, or was it ever correct?
+        deps/
+
+            # Files are named after the package name and metadata hash(?).
+            # The `$pkgname-$META` here appears to correspond to a directory
+            # inside the `.fingerprint` directory.
+            #
+            # TODO: Where is `$META` coming from?
+            # TODO: Where is `$pkgname` coming from?
+            # TODO: These `.d` files seem like they'll be really useful
+            # for what we want to do with build caching.
+            $pkgname-$META.d
+
+            # TODO: What is this? It appears to be an object file?
+            # TODO: Where is this file generated?
+            # TODO: How is `$???` generated?
+            # TODO: Is the `0` significant?
+            $pkgname-$META.$pkgname.$???-cgu.0.rcgu.o
+
+        # This is the location at which the output of all custom build
+        # commands are rooted.
+        build/
+
+            # Each package gets its own directory where its build script output
+            # and the output of building the build script are placed.
+            #
+            # The `$pkgname-$META` here appears to correspond to a directory
+            # inside the `.fingerprint` directory, but not the "Dep builds"
+            # kind of directory inside `.fingerprint`- only the other two.
+            #
+            # TODO: Where is `$META` coming from?
+            # TODO: Where is `$pkgname` coming from?
+            # TODO: The original doc says "build script names may be changed by
+            # user"; what effect does this have on the contents of these
+            # directories and the contents of the corresponding `.fingerprint`
+            # directories?
+            $pkgname-$META/
+                # The build script executable.
+                #
+                # TODO: The original doc says "name may be changed by user",
+                # what does this mean? Would this file have a different name?
+                # TODO: Where is `$META` coming from?
+                build-script-build-$META
+
+                # Hard link to build-script-build-$META.
+                #
+                # TODO: If the user changes the name of the build script,
+                # what happens to this file?
+                build-script-build
+
+                # Dependency information generated by rustc.
+                #
+                # TODO: These `.d` files seem like they'll be really useful
+                # for what we want to do with build caching.
+                # TODO: Where is `$META` coming from?
+                # TODO: If the user changes the name of the build script,
+                # what happens to this file?
+                build-script-build-$META.d
+
+            # The package shows up twice with two different metadata hashes.
+            # This shape seems to be for the output of the build script.
+            #
+            # TODO: The original doc says "build script names may be changed by
+            # user"; what effect does this have on the contents of these
+            # directories and the contents of the corresponding `.fingerprint`
+            # directories?
+            $pkgname-$META/
+                # Timestamp when the build script was last executed.
+                #
+                # This file has no meaningful content; check the `mtime`
+                # of this file for when the dependency was last built.
+                invoked.timestamp
+
+                # Directory where script can output files ($OUT_DIR).
+                # This can be empty.
+                out/
+
+                # Output emitted by the build script when it was executed.
+                #
+                # Reference: https://doc.rust-lang.org/cargo/reference/build-scripts.html
+                output
+
+                # This file contains the fully qualified path to `out`.
+                root-output
+
+                # Stderr output from the build script.
+                # This can be an empty file.
+                stderr
+
+        # Directory used to store incremental data for the compiler.
+        #
+        # TODO: This seems like a _great_ thing for `hurry` to reuse.
+        incremental/
+
+            # TODO: Where is `$pkgname` coming from?
+            # TODO: How is `$???` generated?
+            $pkgname-$???/
+
+                # TODO: How are the `$???`'s generated?
+                # TODO: Is the `s` significant?
+                s-$???-$???.lock
+
+                # The first two `$???` are the same as the corresponding lock.
+                # TODO: How are the `$???`'s generated?
+                s-$???-$???-$???/
+
+                    # Contains a ton of seeming object files with hashes.
+                    # TODO: How is `$???` generated?
+                    $???.o
+
+                    # TODO: What is this?
+                    dep-graph.bin
+
+                    # TODO: What is this?
+                    query-cache.bin
+
+                    # TODO: What is this?
+                    work-products.bin
+
+        # Root directory for all compiled examples.
+        # Currently ignored by `hurry`: it appears low-value.
+        examples/
+
+    # Output from rustdoc.
+    # Currently ignored by `hurry`: it appears low-value.
+    doc/
+
+    # Used by `cargo package` and `cargo publish` to build a `.crate` file.
+    # Currently ignored by `hurry`: it appears low-value.
+    package/
+
+    # Experimental feature for generated build scripts.
+    # Currently ignored by `hurry`, but this seems like a potentially great
+    # thing for `hurry` to use to better cache e.g. build scripts.
+    #
+    # TODO: Docs?
+    # TODO: What kind of "experimental" is this?
+    # TODO: There's a bunch of other build script related stuff in the structure
+    # above; is this just _outdated_? My current implementation doesn't have
+    # this directory.
+    .metabuild/
+```
+
+### Fresh builds
+
+TODO: What steps does `cargo` and `rustc` take to build a fresh workspace?
+
+### Incremental third-party builds
+
+TODO: What steps does `cargo` and `rustc` take to build incremental third-party crates?
+
+TODO: My understanding today is that third-party crates are not actually built incrementally in the same way that first party crates are. Instead, they're always built fully, and an "incremental" third party build is really just "some of the third party dependencies have changed since the last build" (or similar- e.g. "the local rust compiler has changed" or "the rust flags have changed" also trigger rebuilds of third party crates). Is this correct?
+
+### Incremental first-party builds
+
+TODO: What steps does `cargo` and `rustc` take to build incremental first-party crates?
