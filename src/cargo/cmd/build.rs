@@ -43,7 +43,7 @@ pub struct Options {
 
 impl Options {
     /// Get the profile specified by the user.
-    #[instrument]
+    #[instrument(name = "Options::profile")]
     pub fn profile(&self) -> Profile {
         Profile::from_argv(&self.argv)
     }

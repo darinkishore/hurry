@@ -60,6 +60,7 @@ impl Profile {
     /// Get the profile specified by the user.
     ///
     /// If the user didn't specify, defaults to [`Profile::Debug`].
+    #[instrument(name = "Profile::from_argv")]
     pub fn from_argv(argv: &[String]) -> Profile {
         if let Some(profile) = read_argv(argv, "--profile") {
             return Profile::from(profile);
