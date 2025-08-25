@@ -1,8 +1,8 @@
 use clap::Args;
-use color_eyre::Result;
+use color_eyre::{Result, eyre::Context};
 use tracing::instrument;
 
-use crate::cargo::invoke;
+use crate::cargo::{invoke, workspace::Workspace};
 
 /// Options for `cargo run`
 #[derive(Clone, Args, Debug)]
@@ -16,7 +16,8 @@ pub struct Options {
     argv: Vec<String>,
 }
 
-#[instrument]
+#[instrument(name = "cargo_run")]
 pub fn exec(options: Options) -> Result<()> {
-    invoke("run", options.argv)
+    let workspace = Workspace::from_argv(&options.argv).context("open workspace")?;
+    invoke(&workspace, "run", options.argv)
 }
