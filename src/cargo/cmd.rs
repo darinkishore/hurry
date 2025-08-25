@@ -61,7 +61,7 @@ impl Profile {
     ///
     /// If the user didn't specify, defaults to [`Profile::Debug`].
     pub fn from_argv(argv: &[String]) -> Profile {
-        if let Some(profile) = read_argv(argv, "profile") {
+        if let Some(profile) = read_argv(argv, "--profile") {
             return Profile::from(profile);
         }
 
@@ -119,9 +119,9 @@ impl From<&String> for Profile {
 /// Handles cases like:
 /// - `--flag value`
 /// - `--flag=value`
-#[instrument(name = "cargo::read_argv")]
+#[instrument]
 pub fn read_argv<'a>(argv: &'a [String], flag: &str) -> Option<&'a str> {
-    debug_assert!(flag.starts_with("--"), "flag must start with `--`");
+    debug_assert!(flag.starts_with("--"), "flag {:?} must start with `--`", flag);
     argv.into_iter().tuple_windows().find_map(|(a, b)| {
         let (a, b) = (a.trim(), b.trim());
 
