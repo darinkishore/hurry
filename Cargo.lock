@@ -1041,6 +1041,7 @@ dependencies = [
  "lockfile",
  "pretty_assertions",
  "rayon",
+ "regex",
  "relative-path",
  "serde",
  "serde_json",
