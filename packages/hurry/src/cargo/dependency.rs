@@ -1,5 +1,7 @@
 use bon::{Builder, bon};
+use cargo_lock::SourceId;
 use derive_more::{Debug, Display};
+use semver::Version;
 
 use crate::hash::Blake3;
 
@@ -54,7 +56,11 @@ pub struct Dependency {
 
     /// The version of the dependency.
     #[builder(into)]
-    pub version: String,
+    pub version: Version,
+
+    /// The package source.
+    #[builder(into)]
+    pub source_id: SourceId,
 
     /// The checksum of the dependency.
     #[builder(into)]
@@ -83,7 +89,7 @@ impl Dependency {
             .checksum(&self.checksum)
             .name(&self.package_name)
             .target(&self.target)
-            .version(&self.version)
+            .version(&self.version.to_string())
             .call()
     }
 }

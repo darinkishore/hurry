@@ -55,6 +55,8 @@ futures = { workspace = true }
 tempfile = { workspace = true }
 regex = { workspace = true }
 jiff = "0.2.15"
+semver = "1.0.26"
+rustc-stable-hash = "0.1.2"
 
 [dev-dependencies]
 async-walkdir.workspace = true

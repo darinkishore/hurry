@@ -1043,6 +1043,8 @@ dependencies = [
  "rayon",
  "regex",
  "relative-path",
+ "rustc-stable-hash",
+ "semver",
  "serde",
  "serde_json",
  "strum",
@@ -1745,6 +1747,12 @@ name = "rustc-demangle"
 version = "0.1.26"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "56f7d92ca342cea22a06f2121d944b4fd82af56988c270852495420f961d4ace"
+
+[[package]]
+name = "rustc-stable-hash"
+version = "0.1.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "781442f29170c5c93b7185ad559492601acdc71d5bb0706f5868094f45cfcd08"
 
 [[package]]
 name = "rustix"

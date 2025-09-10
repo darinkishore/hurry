@@ -1,6 +1,13 @@
-use std::{fmt::Debug as StdDebug, marker::PhantomData, path::PathBuf, sync::Arc};
+use std::{
+    fmt::Debug as StdDebug,
+    hash::{Hash, Hasher},
+    marker::PhantomData,
+    path::PathBuf,
+    sync::Arc,
+};
 
 use ahash::{HashMap, HashSet};
+use cargo_lock::package::SourceKind;
 use cargo_metadata::{TargetKind, camino::Utf8PathBuf};
 use color_eyre::{
     Result,
@@ -11,6 +18,7 @@ use itertools::{Itertools, process_results};
 use location_macros::workspace_dir;
 use regex::Regex;
 use relative_path::{PathExt, RelativePathBuf};
+use rustc_stable_hash::StableSipHasher128;
 use tap::{Pipe, Tap, TapFallible};
 use tokio::task::spawn_blocking;
 use tracing::{debug, instrument, trace};
@@ -187,7 +195,7 @@ impl Workspace {
         // TODO: How can we properly report `target` for cross compiled deps?
         let dependencies = lockfile.packages.into_iter().filter_map(|package| {
             match (&package.source, &package.checksum) {
-                (Some(source), Some(checksum)) if source.is_default_registry() => {
+                (Some(source_id), Some(checksum)) if source_id.is_default_registry() => {
                     // Ignore workspace members.
                     if workspace_package_names.contains(package.name.as_str()) {
                         return None;
@@ -204,7 +212,8 @@ impl Workspace {
                                 .checksum(checksum.to_string())
                                 .package_name(package.name.to_string())
                                 .lib_name(lib_name)
-                                .version(package.version.to_string())
+                                .version(package.version)
+                                .source_id(source_id.clone())
                                 .target(&rustc_meta.llvm_target)
                                 .build()
                         })
@@ -394,6 +403,41 @@ impl<'ws> ProfileDir<'ws, Unlocked> {
     }
 }
 
+struct PackageArtifactDirHash<'a>(&'a Dependency);
+
+impl<'a> Hash for PackageArtifactDirHash<'a> {
+    // This replicates Cargo's PackageIdStableHashBehavior behavior[^1], used to
+    // calculate the `--out-dir` argument passed to `rustc` via
+    // `CompilationFiles::out_dir`[^2].
+    //
+    // [^1]: https://github.com/rust-lang/cargo/blob/c24e1064277fe51ab72011e2612e556ac56addf7/src/cargo/core/package_id.rs#L203-L209
+    // [^2]: https://github.com/rust-lang/cargo/blob/c24e1064277fe51ab72011e2612e556ac56addf7/src/cargo/core/compiler/build_runner/compilation_files.rs#L210-L226
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.0.package_name.hash(state);
+        self.0.version.hash(state);
+        // Note that this does not yet fully replicate the
+        // `SourceId::stable_hash` behavior[^1] for path and git dependencies.
+        //
+        // [^1]: https://github.com/rust-lang/cargo/blob/c24e1064277fe51ab72011e2612e556ac56addf7/src/cargo/core/source_id.rs#L564-L583
+        SourceKindStableHash(self.0.source_id.kind()).hash(state);
+        self.0.source_id.url().as_str().hash(state);
+    }
+}
+
+struct SourceKindStableHash<'a>(&'a SourceKind);
+
+impl<'a> Hash for SourceKindStableHash<'a> {
+    // This replicates the manual `SourceKind::hash` implementation behavior[^1].
+    //
+    // [^1]: https://github.com/rust-lang/cargo/blob/c24e1064277fe51ab72011e2612e556ac56addf7/crates/cargo-util-schemas/src/core/source_kind.rs#L24-L31
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        core::mem::discriminant(self.0).hash(state);
+        if let SourceKind::Git(git) = self.0 {
+            git.hash(state);
+        }
+    }
+}
+
 impl<'ws> ProfileDir<'ws, Locked> {
     /// Find all cache artifacts for a specific dependency.
     ///
@@ -497,6 +541,23 @@ impl<'ws> ProfileDir<'ws, Locked> {
         // by package name (i.e. file prefix)" rather than doing
         // iter-then-filter.
         let index = self.index.as_ref().ok_or_eyre("files not indexed")?;
+
+        let artifact_pkg_dir = {
+            // The `2` comes from the `METADATA_VERSION` in
+            // `CompilationFiles::target_short_hash`[^1].
+            //
+            // [^1]: https://github.com/rust-lang/cargo/blob/c24e1064277fe51ab72011e2612e556ac56addf7/src/cargo/core/compiler/build_runner/compilation_files.rs#L205
+            let hashable = &(2u8, PackageArtifactDirHash(dependency));
+            let mut hasher = StableSipHasher128::new();
+            hashable.hash(&mut hasher);
+            let hash = Hasher::finish(&hasher);
+            hex::encode(hash.to_le_bytes())
+        };
+        trace!(
+            ?artifact_pkg_dir,
+            ?dependency,
+            "calculated artifact directory"
+        );
 
         // TODO: Figure out how to directly reconstruct the expected package
         // hashes.
