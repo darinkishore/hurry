@@ -42,6 +42,8 @@ impl RustcMetadata {
     /// Get platform metadata from the current compiler.
     #[instrument(name = "RustcMetadata::from_argv")]
     pub async fn from_argv(workspace_root: &AbsDirPath, _argv: &[String]) -> Result<Self> {
+        // TODO: Is this the correct `rustc` to use? Do we need to specially
+        // handle interactions with `rustup` and `rust-toolchain.toml`?
         let mut cmd = tokio::process::Command::new("rustc");
 
         // Bypasses the check that disallows using unstable commands on stable.

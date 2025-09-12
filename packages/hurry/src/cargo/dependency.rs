@@ -56,10 +56,6 @@ pub struct Dependency {
     #[builder(into)]
     pub version: String,
 
-    /// The checksum of the dependency.
-    #[builder(into)]
-    pub checksum: String,
-
     /// The target triple for which the dependency
     /// is being or has been built.
     ///
@@ -80,7 +76,6 @@ impl Dependency {
     #[deprecated = "Refer to TODO's on this type"]
     pub fn key(&self) -> Blake3 {
         Self::key_for()
-            .checksum(&self.checksum)
             .name(&self.package_name)
             .target(&self.target)
             .version(&self.version)
@@ -98,13 +93,11 @@ impl Dependency {
     pub fn key_for(
         name: impl AsRef<[u8]>,
         version: impl AsRef<[u8]>,
-        checksum: impl AsRef<[u8]>,
         target: impl AsRef<[u8]>,
     ) -> Blake3 {
         let name = name.as_ref();
         let version = version.as_ref();
-        let checksum = checksum.as_ref();
         let target = target.as_ref();
-        Blake3::from_fields([name, version, checksum, target])
+        Blake3::from_fields([name, version, target])
     }
 }

@@ -87,7 +87,8 @@ pub async fn cache_target_from_workspace(
     //
     // TODO: this currently assumes that the entire `target/` folder doesn't
     // have any _outdated_ data; this may not be correct.
-    for (key, dependency) in &target.workspace.dependencies {
+    for dependency in &target.workspace.dependencies {
+        let key = dependency.key();
         debug!(?key, ?dependency, "caching dependency");
         let artifacts = match target.enumerate_cache_artifacts(dependency).await {
             Ok(artifacts) => artifacts,
@@ -132,11 +133,11 @@ pub async fn cache_target_from_workspace(
             .context("cache artifacts")?;
 
         cache
-            .store(RecordKind::Cargo, key, &artifacts)
+            .store(RecordKind::Cargo, &key, &artifacts)
             .await
             .context("store cache record")?;
         debug!(?key, ?dependency, ?artifacts, "stored cache record");
-        progress(key, dependency);
+        progress(&key, dependency);
     }
 
     Ok(())
@@ -172,9 +173,10 @@ pub async fn restore_target_from_cache(
     // because that can have a negative effect on performance
     // but we obviously want to have enough running that we saturate the disk.
     debug!(dependencies = ?target.workspace.dependencies, "restoring dependencies");
-    for (key, dependency) in &target.workspace.dependencies {
+    for dependency in &target.workspace.dependencies {
+        let key = dependency.key();
         debug!(?key, ?dependency, "restoring dependency");
-        let record = match cache.get(RecordKind::Cargo, key).await {
+        let record = match cache.get(RecordKind::Cargo, &key).await {
             Ok(Some(record)) => record,
             Ok(None) => {
                 debug!(?key, ?dependency, "no record found for key");
@@ -219,7 +221,7 @@ pub async fn restore_target_from_cache(
             .await;
 
         debug!(?key, ?dependency, ?record, "restored cache record");
-        progress(key, dependency);
+        progress(&key, dependency);
     }
 
     Ok(())

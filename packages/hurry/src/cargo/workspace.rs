@@ -1,16 +1,16 @@
 use std::{marker::PhantomData, sync::Arc};
 
-use ahash::{HashMap, HashSet};
+use ahash::HashSet;
 use cargo_metadata::TargetKind;
 use color_eyre::{
     Result,
     eyre::{Context, OptionExt},
 };
 use derive_more::{Debug, Display};
-use itertools::{Itertools, process_results};
+use itertools::Itertools as _;
 use location_macros::workspace_dir;
 use regex::Regex;
-use tap::{Pipe, Tap, TapFallible};
+use tap::{Pipe as _, Tap as _, TapFallible as _};
 use tokio::task::spawn_blocking;
 use tracing::{debug, instrument, trace};
 
@@ -57,22 +57,21 @@ pub struct Workspace {
     #[debug(skip)]
     pub rustc: RustcMetadata,
 
-    /// Dependencies in the workspace, keyed by [`Dependency::key`].
+    /// Dependencies in the workspace.
     #[debug(skip)]
-    pub dependencies: HashMap<Blake3, Dependency>,
+    pub dependencies: Vec<Dependency>,
 }
 
 impl Workspace {
     /// Create a workspace by parsing metadata from the given directory.
     ///
-    /// Loads and parses `Cargo.toml`, `Cargo.lock`, and rustc metadata
-    /// to build a complete picture of the workspace for caching purposes.
-    /// Only includes third-party dependencies from the default registry
-    /// in the dependencies map.
+    /// Invokes and parses `cargo metadata` and `rustc` to build a complete
+    /// picture of the workspace for caching purposes. Only includes third-party
+    /// dependencies from the default registry in the dependencies map.
     //
-    // TODO: A few of these setup steps could be parallelized...
-    // I'm not certain they're worth the thread spawn cost
-    // but this can be mitigated by using the rayon thread pool.
+    // TODO: A few of these setup steps could be parallelized. I'm not certain
+    // they're worth the thread spawn cost but this can be mitigated by using
+    // the rayon thread pool.
     #[instrument(name = "Workspace::from_argv_in_dir")]
     pub async fn from_argv_in_dir(path: &AbsDirPath, argv: &[String]) -> Result<Self> {
         // TODO: Maybe we should just replicate this logic and perform it
@@ -82,6 +81,13 @@ impl Workspace {
         let manifest_path = read_argv(argv, "--manifest-path").map(String::from);
         let cmd_current_dir = path.as_std_path().to_path_buf();
         let metadata = spawn_blocking(move || -> Result<_> {
+            // TODO: What other flags to `cargo build` can cause different
+            // metadata? We need to reflect all of them in our `cargo metadata`
+            // call.
+            //
+            // For example, can you use environment variables or flags to change
+            // dependency features? Does changing release mode change the
+            // install plan? What about building particular packages or targets?
             cargo_metadata::MetadataCommand::new()
                 .tap_mut(|cmd| {
                     if let Some(p) = manifest_path {
@@ -112,16 +118,6 @@ impl Workspace {
         .pipe(AbsDirPath::try_from)
         .context("parse path as utf8")?;
 
-        // TODO: This currently blows up if we have no lockfile.
-        let cargo_lock = workspace_root.join(mk_rel_file!("Cargo.lock"));
-        let lockfile = spawn_blocking(move || -> Result<_> {
-            cargo_lock::Lockfile::load(cargo_lock.as_std_path()).context("parse cargo lockfile")
-        })
-        .await
-        .context("join task")?
-        .tap_ok(|lockfile| debug!(?lockfile, "cargo lockfile"))
-        .context("read cargo lockfile")?;
-
         let rustc_meta = RustcMetadata::from_argv(&workspace_root, argv)
             .await
             .tap_ok(|rustc_meta| debug!(?rustc_meta, "rustc metadata"))
@@ -138,24 +134,53 @@ impl Workspace {
         //    as a special case. Note that not all workspace members are
         //    binary-only crates! Some may have library crates, and some may be
         //    used as dependencies.
-        let workspace_package_names = metadata
+        let workspace_member_package_ids = metadata
             .workspace_members
-            .iter()
-            .map(|id| {
-                metadata
-                    .packages
-                    .iter()
-                    .find(|package| package.id == *id)
-                    .ok_or_eyre("workspace member not found")
-                    .map(|package| package.name.clone())
-            })
-            .collect::<Result<HashSet<_>>>()?;
+            .into_iter()
+            .collect::<HashSet<_>>();
 
-        // Construct a mapping of _package names_ to _library crate names_.
-        let package_to_lib = metadata
+        // We only care about third party packages for now.
+        //
+        // Only dependencies reported here are actually cached; anything we
+        // exclude here is ignored by the caching system.
+        //
+        // TODO: Support caching packages not in the default registry.
+        //
+        // TODO: Support caching first party packages.
+        //
+        // TODO: Support caching git, etc. packages.
+        //
+        // TODO: How can we properly report `target` for cross compiled deps?
+        let dependencies = metadata
             .packages
-            .iter()
-            .filter_map(|package| {
+            .into_iter()
+            .filter(|package| {
+                if workspace_member_package_ids.contains(&package.id) {
+                    // Ignore workspace members for now.
+                    trace!(
+                        ?package,
+                        reason = "workspace member",
+                        "skipped indexing package for cache"
+                    );
+                    false
+                } else if !package.source.as_ref().is_some_and(|s| s.is_crates_io()) {
+                    // Ignore packages that are not crates.io dependencies.
+                    trace!(
+                        ?package,
+                        reason = "unsupported source",
+                        "skipped indexing package for cache"
+                    );
+                    false
+                } else {
+                    true
+                }
+            })
+            .map(|package| -> Result<Dependency> {
+                // We know that there must be exactly one library crates, because all dependency packages must have a
+                // library crate.
+                //
+                // The only packages that might not have a library crate are workspace members (there might be a binary-only
+                // workspace member), and we've filtered all of those out already.
                 let libs = package
                     .targets
                     .iter()
@@ -171,75 +196,22 @@ impl Workspace {
                     })
                     .collect::<Vec<_>>();
                 let len = libs.len();
-                // Workspace members might be binary-only crates.
-                if len < 1 && workspace_package_names.contains(&package.name) {
-                    return None;
-                }
-                libs.into_iter()
-                    .exactly_one()
-                    .with_context(|| {
-                        format!(
-                            "package {} has {} library targets but expected 1: {:?}",
-                            package.name, len, package.targets
-                        )
-                    })
-                    .map(|lib| (package.name.as_str(), lib))
-                    .pipe(Some)
+                let lib_name = libs.into_iter().exactly_one().with_context(|| {
+                    format!(
+                        "package {} has {} library targets but expected 1: {:?}",
+                        package.name, len, package.targets
+                    )
+                })?;
+
+                Dependency::builder()
+                    .package_name(package.name.to_string())
+                    .lib_name(lib_name)
+                    .version(package.version.to_string())
+                    .target(&rustc_meta.llvm_target)
+                    .build()
+                    .pipe(Ok)
             })
-            .collect::<Result<HashMap<_, _>>>()?;
-
-        // We only care about third party packages for now.
-        //
-        // From observation, first party packages seem to have
-        // no `source` or `checksum` while third party packages do,
-        // so we just filter anything that doesn't have these.
-        //
-        // In addition, to keep things simple, we filter to only
-        // packages that are in the default registry.
-        //
-        // Only dependencies reported here are actually cached;
-        // anything we exclude here is ignored by the caching system.
-        //
-        // TODO: Support caching packages not in the default registry.
-        // TODO: Support caching first party packages.
-        // TODO: Support caching git etc packages.
-        // TODO: How can we properly report `target` for cross compiled deps?
-        let dependencies = lockfile.packages.into_iter().filter_map(|package| {
-            match (&package.source, &package.checksum) {
-                (Some(source), Some(checksum)) if source.is_default_registry() => {
-                    // Ignore workspace members.
-                    if workspace_package_names.contains(package.name.as_str()) {
-                        return None;
-                    }
-
-                    package_to_lib
-                        .get(package.name.as_str())
-                        .ok_or_eyre(format!(
-                            "package {:?} has unknown library target",
-                            package.name.as_str()
-                        ))
-                        .map(|lib_name| {
-                            Dependency::builder()
-                                .checksum(checksum.to_string())
-                                .package_name(package.name.to_string())
-                                .lib_name(lib_name)
-                                .version(package.version.to_string())
-                                .target(&rustc_meta.llvm_target)
-                                .build()
-                        })
-                        .pipe(Some)
-                }
-                _ => {
-                    trace!(?package, "skipped indexing package for cache");
-                    None
-                }
-            }
-        });
-        let dependencies = process_results(dependencies, |iter| {
-            iter.map(|dependency| (dependency.key(), dependency))
-                .inspect(|(key, dependency)| trace!(?key, ?dependency, "indexed dependency"))
-                .collect::<HashMap<_, _>>()
-        })?;
+            .collect::<Result<Vec<_>, _>>()?;
 
         Ok(Self {
             root: workspace_root,
