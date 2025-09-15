@@ -1,4 +1,4 @@
-use std::{marker::PhantomData, sync::Arc};
+use std::{fmt::Debug, marker::PhantomData, sync::Arc};
 
 use ahash::{HashMap, HashSet};
 use cargo_metadata::TargetKind;
@@ -6,7 +6,7 @@ use color_eyre::{
     Result,
     eyre::{Context, OptionExt},
 };
-use derive_more::{Debug, Display};
+use derive_more::{Debug as DebugExt, Display};
 use itertools::{Itertools, process_results};
 use location_macros::workspace_dir;
 use regex::Regex;
@@ -17,7 +17,7 @@ use tracing::{debug, instrument, trace};
 use crate::{
     Locked, Unlocked,
     cache::FsCas,
-    cargo::DepInfoDependencyPath,
+    cargo::{BuildScriptOutput, QualifiedPath, RootOutput},
     fs::{self, Index, LockFile},
     hash::Blake3,
     mk_rel_file,
@@ -39,7 +39,7 @@ use super::{
 ///
 /// Note: For hurry's purposes, workspace and non-workspace projects
 /// are treated identically.
-#[derive(Debug, Display)]
+#[derive(DebugExt, Display)]
 #[display("{root}")]
 pub struct Workspace {
     /// The root directory of the workspace.
@@ -321,7 +321,7 @@ impl Workspace {
 /// - `Unlocked`: No file operations allowed
 /// - `Locked`: Exclusive access with file index and directory
 /// - Locking is compatible with Cargo's own locking mechanism
-#[derive(Debug, Clone)]
+#[derive(DebugExt, Clone)]
 pub struct ProfileDir<'ws, State> {
     #[debug(skip)]
     state: PhantomData<State>,
@@ -593,8 +593,9 @@ impl<'ws> ProfileDir<'ws, Locked> {
                 .build_outputs()
                 .into_iter()
                 .filter_map(|output| match output {
-                    DepInfoDependencyPath::RelativeTargetProfile(p) => Some(p),
-                    DepInfoDependencyPath::RelativeCargoHome(_) => None,
+                    QualifiedPath::Rootless(p) => Some(p),
+                    QualifiedPath::RelativeTargetProfile(p) => Some(p),
+                    QualifiedPath::RelativeCargoHome(_) => None,
                 })
                 .collect::<HashSet<_>>();
             dependencies.extend(deps.iter().filter(|&path| outputs.contains(path)));
@@ -628,13 +629,27 @@ impl<'ws> ProfileDir<'ws, Locked> {
     ) -> Result<(Blake3, AbsFilePath)> {
         let file = self.root.join(file);
         let raw = fs::must_read_buffered(&file).await.context("read file")?;
+
+        // TODO: If we keep rewrites with this sort of structure we probably
+        // want to turn them into a more generic operation instead of having to
+        // retype all this boilerplate every time.
         let content = match CasRewrite::from_path(&file) {
             CasRewrite::None => raw,
+            CasRewrite::RootOutput => RootOutput::from_file(self, &file)
+                .await
+                .context("parse")?
+                .pipe_ref(serde_json::to_vec)
+                .context("serialize")?,
+            CasRewrite::BuildScriptOutput => BuildScriptOutput::from_file(self, &file)
+                .await
+                .context("parse")?
+                .pipe_ref(serde_json::to_vec)
+                .context("serialize")?,
             CasRewrite::DepInfo => DepInfo::from_file(self, &file)
                 .await
-                .context("parse depinfo")?
+                .context("parse")?
                 .pipe_ref(serde_json::to_vec)
-                .context("serialize depinfo")?,
+                .context("serialize")?,
         };
 
         cas.store(&content)
@@ -654,11 +669,21 @@ impl<'ws> ProfileDir<'ws, Locked> {
     ) -> Result<AbsFilePath> {
         let file = self.root.join(file);
         let content = cas.must_get(key).await.context("get content from CAS")?;
+
+        // TODO: If we keep rewrites with this sort of structure we probably
+        // want to turn them into a more generic operation instead of having to
+        // retype all this boilerplate every time.
         let raw = match CasRewrite::from_path(&file) {
             CasRewrite::None => content,
+            CasRewrite::RootOutput => serde_json::from_slice::<RootOutput>(&content)
+                .context("deserialize")
+                .map(|f| f.reconstruct(self).into_bytes())?,
+            CasRewrite::BuildScriptOutput => serde_json::from_slice::<BuildScriptOutput>(&content)
+                .context("deserialize")
+                .map(|f| f.reconstruct(self).into_bytes())?,
             CasRewrite::DepInfo => serde_json::from_slice::<DepInfo>(&content)
-                .context("deserialize depinfo")
-                .map(|dotd| dotd.reconstruct(self).into_bytes())?,
+                .context("deserialize")
+                .map(|f| f.reconstruct(self).into_bytes())?,
         };
         fs::write(&file, &raw)
             .await
@@ -670,6 +695,14 @@ impl<'ws> ProfileDir<'ws, Locked> {
 /// Some files need to be rewritten when stored in or restored from the CAS.
 /// This type supports parsing a path to determine whether it should be
 /// rewritten, and if so using what strategy.
+///
+/// A core intention of this type is to _always_ only replace things that
+/// `hurry` can actually _parse_- no blanket "replace all" functionality.
+/// The reasoning here is that while we want to make builds faster,
+/// we **cannot** make them incorrect; if we skip rewriting something
+/// that Cargo needs it'll simply recompile while if we overzealously rewrite
+/// things we don't actually know anything about we might cause subtle and
+/// bugs in the compilation phase which we absolutely cannot afford to do.
 #[derive(Copy, Clone, Eq, PartialEq, Ord, PartialOrd, Hash, Debug, Default)]
 enum CasRewrite {
     /// No rewriting should take place.
@@ -678,20 +711,83 @@ enum CasRewrite {
 
     /// This is a "dep-info" file, so use the "dep-info" rewrite strategy.
     DepInfo,
+
+    /// This is a "root output" file, used for build scripts.
+    ///
+    /// This file contains the fully qualified path to `out`, which is the
+    /// directory where script can output files (provided to the script as
+    /// $OUT_DIR).
+    ///
+    /// These are correct to rewrite because the content of the `out` directory
+    /// should have also been restored, but even if it wasn't it's certainly not
+    /// correct to try to read or write content from the old location.
+    ///
+    /// Example taken from an actual project:
+    /// ```not_rust
+    /// /Users/jess/scratch/example/target/debug/build/rustls-5590c033895e7e9a/out
+    /// ```
+    RootOutput,
+
+    /// This is an "output" file, which is the output of the build script when
+    /// it was executed.
+    ///
+    /// These are correct to rewrite because paths in this output will almost
+    /// definitely be referencing either something local or something in
+    /// `$CARGO_HOME`.
+    ///
+    /// Example output taken from an actual project:
+    /// ```not_rust
+    /// OUT_DIR = Some(/Users/jess/scratch/example/target/debug/build/zstd-sys-eb89796c05cc5c90/out)
+    /// OUT_DIR = Some(/Users/jess/scratch/example/target/debug/build/zstd-sys-eb89796c05cc5c90/out)
+    /// OUT_DIR = Some(/Users/jess/scratch/example/target/debug/build/zstd-sys-eb89796c05cc5c90/out)
+    /// OUT_DIR = Some(/Users/jess/scratch/example/target/debug/build/zstd-sys-eb89796c05cc5c90/out)
+    /// cargo:rustc-link-search=native=/Users/jess/scratch/example/target/debug/build/zstd-sys-eb89796c05cc5c90/out
+    /// cargo:root=/Users/jess/scratch/example/target/debug/build/zstd-sys-eb89796c05cc5c90/out
+    /// cargo:include=/Users/jess/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/zstd-sys-2.0.15+zstd.1.5.7/zstd/lib
+    /// ```
+    ///
+    /// Reference: https://doc.rust-lang.org/cargo/reference/build-scripts.html
+    BuildScriptOutput,
 }
 
 impl CasRewrite {
     /// Determine the rewrite strategy from the file path.
     fn from_path(target: &AbsFilePath) -> Self {
-        let Some(name) = target.file_name_str_lossy() else {
-            return Self::default();
-        };
-        let Some((_, ext)) = name.rsplit_once('.') else {
-            return Self::default();
-        };
-        match ext {
-            "d" => Self::DepInfo,
-            _ => Self::default(),
-        }
+        // `.rev()` and `.take(1)` are because while we're iterating over
+        // components, we really don't care about reading the whole path- just
+        // the few elements at the end.
+        target
+            .component_strs_lossy()
+            .rev()
+            .tuple_windows()
+            .take(1)
+            .find_map(|(name, _, gparent)| {
+                // Theoretically, we could blanket rewrite all paths in all text
+                // files- but we follow a conservative approach here because
+                // above all we don't want to silently cause miscompilations and
+                // we don't want to do more work than is needed.
+                //
+                // For example, we don't rewrite `stderr` output files for build
+                // scripts, because they're only for humans to read. Also some
+                // example projects emit other arbitrary text files; e.g. the
+                // build script for `aws-lc-sys` emits a file at
+                // `./target/debug/build/aws-lc-sys-3f4f475625566422/out/memcmp_invalid_stripped_check.dSYM/Contents/Resources/Relocations/aarch64/memcmp_invalid_stripped_check.yml`
+                // which we don't try to replace because we don't really know
+                // anything about this file.
+                //
+                // We do know however that it's common practice in the Rust
+                // community to back up and restore files in `target` for
+                // caching, so we can only assume that library authors know this
+                // and can recover from or at least detect this sort of scenario
+                // if they care.
+                let ext = name.rsplit_once('.').map(|(_, ext)| ext);
+                match (gparent.as_ref(), name.as_ref(), ext) {
+                    ("build", "output", _) => Some(Self::BuildScriptOutput),
+                    ("build", "root-output", _) => Some(Self::RootOutput),
+                    (_, _, Some("d")) => Some(Self::DepInfo),
+                    _ => None,
+                }
+            })
+            .unwrap_or_default()
     }
 }
