@@ -8,6 +8,9 @@ set -euo pipefail
 #   curl -sSfL https://raw.githubusercontent.com/attunehq/hurry/main/install.sh | bash -s -- -b /usr/local/bin
 #   curl -sSfL https://raw.githubusercontent.com/attunehq/hurry/main/install.sh | bash -s -- -v v0.1.0
 #
+# If the repository is private, set GITHUB_TOKEN:
+#   GITHUB_TOKEN=<token> curl -sSfL https://raw.githubusercontent.com/attunehq/hurry/main/install.sh | bash
+#
 # Options:
 #   -v, --version    Specify a version (default: latest)
 #   -b, --bin-dir    Specify the installation directory (default: $HOME/.local/bin)
@@ -105,6 +108,9 @@ parse_args() {
         echo
         echo "Usage: curl -sSfL https://raw.githubusercontent.com/attunehq/hurry/main/install.sh | bash [args]"
         echo
+        echo "If the repository is private, set GITHUB_TOKEN:"
+        echo "  GITHUB_TOKEN=<token> curl -sSfL https://raw.githubusercontent.com/attunehq/hurry/main/install.sh | bash"
+        echo
         echo "Options:"
         echo "  -v, --version    Specify a version (default: latest)"
         echo "  -b, --bin-dir    Specify the installation directory (default: \$HOME/.local/bin)"
@@ -123,23 +129,87 @@ parse_args() {
 get_latest_version() {
   local url="https://api.github.com/repos/attunehq/hurry/releases/latest"
   local version
+  local curl_args=(-sSfL)
 
-  if ! version=$(curl -sSfL "$url" | grep -o '"tag_name": "v[^"]*"' | cut -d'"' -f4); then
-    fail "Failed to get latest version from GitHub"
+  # Add authentication header if GITHUB_TOKEN is set
+  if [[ -n "${GITHUB_TOKEN:-}" ]]; then
+    curl_args+=(-H "Authorization: Bearer $GITHUB_TOKEN")
+  fi
+
+  if ! version=$(curl "${curl_args[@]}" "$url" | grep -o '"tag_name": "v[^"]*"' | cut -d'"' -f4); then
+    if [[ -n "${GITHUB_TOKEN:-}" ]]; then
+      fail "Failed to get latest version from GitHub. Please verify your GITHUB_TOKEN has access to the repository."
+    else
+      fail "Failed to get latest version from GitHub. If the repository is private, set GITHUB_TOKEN environment variable."
+    fi
   fi
 
   echo "$version"
+}
+
+# Get download URL for a release asset from GitHub API
+get_asset_download_url() {
+  local version="$1"
+  local asset_name="$2"
+  local url="https://api.github.com/repos/attunehq/hurry/releases/tags/${version}"
+  local download_url
+  local curl_args=(-sSfL)
+
+  # Add authentication header if GITHUB_TOKEN is set
+  if [[ -n "${GITHUB_TOKEN:-}" ]]; then
+    curl_args+=(-H "Authorization: Bearer $GITHUB_TOKEN")
+    # For private repos, we need to use the API download URL with Accept header
+    curl_args+=(-H "Accept: application/octet-stream")
+  fi
+
+  if [[ -n "${GITHUB_TOKEN:-}" ]]; then
+    # For private repos, get the asset ID and use the API download endpoint
+    local release_data asset_id
+    local api_curl_args=(-sSfL -H "Authorization: Bearer $GITHUB_TOKEN")
+    if ! release_data=$(curl "${api_curl_args[@]}" "$url"); then
+      fail "Failed to get release data for $version"
+    fi
+
+    # Parse JSON to find asset ID
+    if ! asset_id=$(echo "$release_data" | grep -B 2 -A 2 "\"name\": \"$asset_name\"" | grep '"id":' | head -n 1 | sed 's/.*"id": *\([0-9]*\).*/\1/'); then
+      fail "Failed to find asset '$asset_name' in release $version"
+    fi
+
+    if [[ -z "$asset_id" ]]; then
+      fail "Asset ID not found for $asset_name"
+    fi
+
+    download_url="https://api.github.com/repos/attunehq/hurry/releases/assets/$asset_id"
+  else
+    # For public repos, use direct download URL
+    download_url="https://github.com/attunehq/hurry/releases/download/${version}/${asset_name}"
+  fi
+
+  echo "$download_url"
 }
 
 # Download a file
 download() {
   local url="$1"
   local dest="$2"
+  local curl_args=(-sSfL)
 
-  info "Downloading $url to $dest"
+  info "Downloading to $dest"
 
-  if ! curl -sSfL "$url" -o "$dest"; then
-    fail "Failed to download from $url"
+  # Add authentication header if GITHUB_TOKEN is set and URL is from GitHub API
+  if [[ -n "${GITHUB_TOKEN:-}" ]] && [[ "$url" == *"api.github.com"* ]]; then
+    curl_args+=(-H "Authorization: Bearer $GITHUB_TOKEN")
+    curl_args+=(-H "Accept: application/octet-stream")
+  elif [[ -n "${GITHUB_TOKEN:-}" ]] && [[ "$url" == *"github.com"* ]]; then
+    curl_args+=(-H "Authorization: Bearer $GITHUB_TOKEN")
+  fi
+
+  if ! curl "${curl_args[@]}" "$url" -o "$dest"; then
+    if [[ -n "${GITHUB_TOKEN:-}" ]] && [[ "$url" == *"github.com"* ]]; then
+      fail "Failed to download from GitHub. Please verify your GITHUB_TOKEN has access to the repository."
+    else
+      fail "Failed to download from $url"
+    fi
   fi
 }
 
@@ -153,11 +223,10 @@ install_binary() {
   local checksums_url
   local archive_name="hurry-${platform}.tar.gz"
   local binary_name="hurry"
-  local release_prefix="https://github.com/attunehq/hurry/releases/download/${version}"
 
   # Construct download URLs
-  download_url="${release_prefix}/${archive_name}"
-  checksums_url="${release_prefix}/checksums.txt"
+  download_url=$(get_asset_download_url "$version" "$archive_name")
+  checksums_url=$(get_asset_download_url "$version" "checksums.txt")
 
   # Create temporary directory
   local workdir="$tmp_dir/hurry-install-$$"
@@ -211,16 +280,7 @@ install_binary() {
 
   # Check if bin_dir is in PATH
   if [[ ":$PATH:" != *":$bin_dir:"* ]]; then
-    warn "'$bin_dir' is not in your PATH. You may need to add it."
-    if [[ "$SHELL" == */zsh ]]; then
-      echo "To add it, you can run: echo 'export PATH=\"\$PATH:$bin_dir\"' >> ~/.zshrc"
-    elif [[ "$SHELL" == */bash ]]; then
-      echo "To add it, you can run: echo 'export PATH=\"\$PATH:$bin_dir\"' >> ~/.bashrc"
-    elif [[ "$SHELL" == */fish ]]; then
-      echo "To add it, you can run: fish -c \"fish_add_path $bin_dir\""
-    else
-      echo "To add it, add the following to your shell's init file: export PATH=\"\$PATH:$bin_dir\""
-    fi
+    warn "'$bin_dir' is not in your PATH. You may need to add it to your shell's configuration."
   fi
 }
 
