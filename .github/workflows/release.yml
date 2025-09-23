@@ -125,11 +125,11 @@ jobs:
           - target: aarch64-apple-darwin
             os: macos-latest
             cross: false
+
+          # Cross compilation needed
           - target: aarch64-unknown-linux-gnu
             os: ubuntu-latest
             cross: true
-
-          # Cross compilation needed
           - target: x86_64-unknown-linux-musl
             os: ubuntu-latest
             cross: true
