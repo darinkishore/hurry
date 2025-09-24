@@ -114,6 +114,10 @@ pub async fn run() -> color_eyre::Result<ExitStatus> {
         .context("invalid cargo invocation log dir")?
         .try_join_dir(&cargo_invocation_id)
         .context("invalid cargo invocation cache dirname")?;
+    // TODO: Enumerate all the environment variables (both ones that alter Cargo
+    // behavior and ones that Cargo sets for rustc).
+    //
+    // See also: https://doc.rust-lang.org/cargo/reference/environment-variables.html
     let cargo_envs = std::env::vars()
         .filter(|(key, _)| key == "OUT_DIR" || key.starts_with("CARGO_"))
         .collect::<BTreeMap<_, _>>();

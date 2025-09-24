@@ -384,6 +384,7 @@ There are several ways to get build information out of Cargo:
 2. `cargo metadata` provides information about the "packages" and "resolved dependencies" of the workspace.
 3. `cargo build --message-format=json-diagnostic-rendered-ansi` provides formatted output messages from the compiler as it runs.
 4. `cargo build --unit-graph` provides information about the "unit graph" of the build.
+5. `cargo build --build-plan` provides information about the "build plan" of the build.
 
 Each of these methods has their own trade-offs, and they're all incomplete or inconvenient in various ways. In order to get the information we need, we combine all of these methods.
 
@@ -448,16 +449,32 @@ Some not-so-nice properties of this format:
 
 1. This format doesn't provide the actual artifact filenames, so we can't tell what which file suffix is used for artifacts of which unit.
 
+#### `cargo build` build plan
+
+`cargo +nightly build --build-plan -Z unstable-options` provides information about the "build plan" of the build. This format is documented [here](https://doc.rust-lang.org/cargo/reference/unstable.html#build-plan). Note that we can invoke this behavior on the stable Cargo tool by setting `RUSTC_BOOTSTRAP=1`.
+
+Some nice properties of this format:
+
+1. It provides the artifact names of all generated outputs.
+2. It provides all `rustc` invocations _and_ all build script invocations.
+3. It ties each invocation to the package being built.
+
+Some not-so-nice properties of this format:
+
+1. It doesn't provide a graph of dependencies (it only provides a list of invocations), so it doesn't tell us _why_ a particular invocation is being run.
+2. The feature is allegedly deprecated, although it has not been removed in [six years](https://github.com/rust-lang/cargo/issues/7614).
+
 #### How we combine this information
 
-1. We can use the unit graph to find the root units.
-2. We can map those to RUSTC invocations by guessing using the entrypoint source files.
-3. From there, we can build a graph by looking at `--extern` flags and seeing which are needed.
-4. We know which `.fingerprint` files to restore because they share a folder suffix.
-5. We know the folder names of the build script _executions_ because `OUT_DIR` will be set on the packages.
-6. TODO: How do we get the folder names of the compiled build scripts themselves?
-   1. Oh shit, it's in the `--out-dir`
-   2. Maybe we just need to make sure the features match?
-   3. But we still can't tell which execution lines up with which compiled script
-   4. Hmm, maybe we can read the fingerprint's `build-script-build-script-build.json`? That has a `features` field in it. Are different features always the only reason why there might be multiple build scripts?
-      1. Wait, this is only in the compiled folder, not the actual execution folder
+1. Use the unit graph to enumerate all units. In particular, this will provide us with the _dependencies_ of each unit, which we need in order to properly key the cached artifact.
+2. Use the `rustc` invocations to map each unit to its generated artifacts. We should be able to map each invocation to a unit in the unit graph by the unit's `src_path`.
+   1. In cases where there are multiple matching units, each unit must either have (1) different features or (2) different dependencies. We can match features against the parsed invocation, and we can match dependencies by building a graph of `--extern` flags and mapping the upstream sources (which must have different features) to the unit graph.
+3. Use the build plan to map each build script to its `OUT_DIR`. We do this because there are no better options here (as a fallback, we could try to guess `out_dir` using ordering of the build JSON messages), although we try to rely as little on this feature as possible since it's deprecated and the tracking issue claims there are broken edge cases in its logic.
+
+Now, for each unit, we should know:
+1. Its compiled artifact folder.
+2. Its build script folder.
+3. Its build script execution folder.
+4. Its dependencies.
+
+This information should be sufficient to cache and key the unit.
