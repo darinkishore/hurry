@@ -466,15 +466,17 @@ Some not-so-nice properties of this format:
 
 #### How we combine this information
 
-1. Use the unit graph to enumerate all units. In particular, this will provide us with the _dependencies_ of each unit, which we need in order to properly key the cached artifact.
-2. Use the `rustc` invocations to map each unit to its generated artifacts. We should be able to map each invocation to a unit in the unit graph by the unit's `src_path`.
+1. Use the unit graph to enumerate all units. In particular, this will provide us with the _dependencies_ of each unit, which we need in order to properly key the cached artifact and find its build script.
+2. Use the build plan to map each unit to its generated artifacts (via `-C extra-filename`) and build script execution artifacts (via `OUT_DIR`).
    1. In cases where there are multiple matching units, each unit must either have (1) different features or (2) different dependencies. We can match features against the parsed invocation, and we can match dependencies by building a graph of `--extern` flags and mapping the upstream sources (which must have different features) to the unit graph.
-3. Use the build plan to map each build script to its `OUT_DIR`. We do this because there are no better options here (as a fallback, we could try to guess `out_dir` using ordering of the build JSON messages), although we try to rely as little on this feature as possible since it's deprecated and the tracking issue claims there are broken edge cases in its logic.
+   2. NOTE: the build plan invocations are slightly wrong because build plan construction does not run build scripts, and therefore can't know certain `rustc` arguments that can be added by build script outputs (e.g. `cargo::rustc-link-lib`). However, build script outputs cannot change `--extern` flags and cannot change `OUT_DIR`, so our usage of the build plan here is safe.
+3. Use the `cargo build --message-format=json` `build-script-executed` messages to get the missing build script output flags, and map it to units via `out_dir`. We use this instead of `RUSTC_WRAPPER` because this saves and replays cached build script output of dependencies that don't need to be rebuilt, so we can get linker flags even for dependencies that are fresh.
 
 Now, for each unit, we should know:
 1. Its compiled artifact folder.
 2. Its build script folder.
 3. Its build script execution folder.
 4. Its dependencies.
+5. Its rustc flags.
 
 This information should be sufficient to cache and key the unit.
