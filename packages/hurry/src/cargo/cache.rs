@@ -3,82 +3,46 @@ use std::{
     fmt::Debug,
     io::Write,
     path::PathBuf,
-    str::FromStr as _,
     time::{Duration, UNIX_EPOCH},
 };
 
 use cargo_metadata::TargetKind;
 use color_eyre::{
     Result,
-    eyre::{Context as _, OptionExt, Report, bail},
+    eyre::{Context as _, OptionExt, bail},
 };
 use futures::TryStreamExt as _;
+use itertools::Itertools;
 use serde::Serialize;
-use sqlx::{
-    SqlitePool,
-    migrate::Migrator,
-    sqlite::{SqliteConnectOptions, SqlitePoolOptions},
-};
 use tap::Pipe as _;
 use tokio::task::JoinSet;
-use tracing::{debug, error, instrument, trace, warn};
+use tracing::{debug, instrument, trace, warn};
 
 use crate::{
+    Locked,
     cargo::{
-        self, BuildPlan, CargoBuildArguments, CargoCompileMode, Profile, RustcMetadata, Workspace,
+        self, BuildPlan, BuildScriptOutput, CargoBuildArguments, CargoCompileMode, DepInfo,
+        Profile, ProfileDir, QualifiedPath, RootOutput, RustcMetadata, Workspace,
     },
-    cas::FsCas,
+    cas::CourierCas,
+    client::{ArtifactFile, CargoRestoreRequest, CargoSaveRequest, Courier},
     fs,
     hash::Blake3,
-    mk_rel_dir, mk_rel_file,
-    path::{AbsDirPath, AbsFilePath, JoinWith as _, TryJoinWith as _},
+    path::{AbsDirPath, AbsFilePath, TryJoinWith as _},
 };
 
 #[derive(Debug, Clone)]
 pub struct CargoCache {
-    cas: FsCas,
-    db: SqlitePool,
+    courier: Courier,
+    cas: CourierCas,
     ws: Workspace,
 }
 
 impl CargoCache {
-    /// The migrator for the database.
-    pub const MIGRATOR: Migrator = sqlx::migrate!("./schema/migrations");
-
     #[instrument(name = "CargoCache::open")]
-    async fn open(cas: FsCas, conn: &str, ws: Workspace) -> Result<Self> {
-        let options = SqliteConnectOptions::from_str(conn)
-            .context("parse sqlite connection string")?
-            .create_if_missing(true);
-        let db = SqlitePoolOptions::new()
-            .connect_with(options)
-            .await
-            .context("connecting to cargo cache database")?;
-        Self::MIGRATOR
-            .run(&db)
-            .await
-            .context("running migrations")?;
-        Ok(Self { cas, db, ws })
-    }
-
-    #[instrument(name = "CargoCache::open_dir")]
-    pub async fn open_dir(cas: FsCas, cache_dir: &AbsDirPath, ws: Workspace) -> Result<Self> {
-        let dbfile = cache_dir.join(mk_rel_file!("cache.db"));
-        fs::create_dir_all(cache_dir)
-            .await
-            .context("create cache directory")?;
-
-        Self::open(cas, &format!("sqlite://{}", dbfile), ws).await
-    }
-
-    #[instrument(name = "CargoCache::open_default")]
-    pub async fn open_default(ws: Workspace) -> Result<Self> {
-        let cas = FsCas::open_default().await.context("opening CAS")?;
-        let cache = fs::user_global_cache_path()
-            .await
-            .context("finding user cache path")?
-            .join(mk_rel_dir!("cargo"));
-        Self::open_dir(cas, &cache, ws).await
+    pub async fn open(courier: Courier, ws: Workspace) -> Result<Self> {
+        let cas = CourierCas::new(courier.clone());
+        Ok(Self { cas, courier, ws })
     }
 
     #[instrument(name = "CargoCache::artifacts")]
@@ -440,11 +404,31 @@ impl CargoCache {
         // TODO: Fuse this operation with the loop above where we discover the
         // needed files? Would that give better performance?
         let mut library_unit_files = vec![];
+        let mut artifact_files = vec![];
         for path in files_to_save {
             match fs::read_buffered(&path).await? {
                 Some(content) => {
+                    let content = Self::rewrite(&profile_dir, &path, &content).await?;
+
                     let key = self.cas.store(&content).await?;
                     debug!(?path, ?key, "stored object");
+
+                    // Gather metadata for the artifact file.
+                    let metadata = fs::Metadata::from_file(&path)
+                        .await?
+                        .ok_or_eyre("could not stat file metadata")?;
+                    let mtime_nanos = metadata.mtime.duration_since(UNIX_EPOCH)?.as_nanos();
+                    let portable = QualifiedPath::parse(&profile_dir, path.as_std_path()).await?;
+
+                    artifact_files.push(
+                        ArtifactFile::builder()
+                            .object_key(key.to_string())
+                            .path(portable)
+                            .mtime_nanos(mtime_nanos)
+                            .executable(metadata.executable)
+                            .build(),
+                    );
+
                     library_unit_files.push((path, key));
                 }
                 None => {
@@ -467,293 +451,231 @@ impl CargoCache {
         };
         debug!(?content_hash, "calculated content hash");
 
-        // Save the library unit into the database.
-        let mut tx = self.db.begin().await?;
+        // Save the library unit via the Courier API.
+        let request = CargoSaveRequest::builder()
+            .package_name(artifact.package_name)
+            .package_version(artifact.package_version)
+            .target(artifact.target)
+            .library_crate_compilation_unit_hash(artifact.library_crate_compilation_unit_hash)
+            .maybe_build_script_compilation_unit_hash(artifact.build_script_compilation_unit_hash)
+            .maybe_build_script_execution_unit_hash(artifact.build_script_execution_unit_hash)
+            .content_hash(content_hash)
+            .artifacts(artifact_files)
+            .build();
 
-        // Find or create the package.
-        let package_id = match sqlx::query!(
-            // TODO: Why does this require a type override? Shouldn't sqlx infer
-            // the non-nullability from the INTEGER PRIMARY KEY column type?
-            "SELECT id AS \"id!: i64\" FROM package WHERE name = $1 AND version = $2",
-            artifact.package_name,
-            artifact.package_version
-        )
-        .fetch_optional(&mut *tx)
-        .await?
-        {
-            Some(row) => row.id,
-            None => {
-                sqlx::query!(
-                    "INSERT INTO package (name, version) VALUES ($1, $2) RETURNING id",
-                    artifact.package_name,
-                    artifact.package_version
-                )
-                .fetch_one(&mut *tx)
-                .await?
-                .id
-            }
-        };
-        // Check whether a library unit build exists.
-        match sqlx::query!(
-            r#"
-            SELECT content_hash
-            FROM library_unit_build
-            WHERE
-                package_id = $1
-                AND target = $2
-                AND library_crate_compilation_unit_hash = $3
-                AND COALESCE(build_script_compilation_unit_hash, '') = COALESCE($4, '')
-                AND COALESCE(build_script_execution_unit_hash, '') = COALESCE($5, '')
-            "#,
-            package_id,
-            artifact.target,
-            artifact.library_crate_compilation_unit_hash,
-            artifact.build_script_compilation_unit_hash,
-            artifact.build_script_execution_unit_hash
-        )
-        .fetch_optional(&mut *tx)
-        .await?
-        {
-            Some(row) => {
-                // If it does exist, and the content hash is the same, there is
-                // nothing more to do. If it exists but the content hash is
-                // different, then something has gone wrong with our cache key,
-                // and we should log an error message.
-                if row.content_hash != content_hash {
-                    error!(expected = ?row.content_hash, actual = ?content_hash, "content hash mismatch");
-                }
-            }
-            None => {
-                // Insert the library unit build.
-                let library_unit_build_id = sqlx::query!(
-                    r#"
-                    INSERT INTO library_unit_build (
-                        package_id,
-                        target,
-                        library_crate_compilation_unit_hash,
-                        build_script_compilation_unit_hash,
-                        build_script_execution_unit_hash,
-                        content_hash
-                    ) VALUES ($1, $2, $3, $4, $5, $6)
-                    RETURNING id AS "id!: i64"
-                    "#,
-                    package_id,
-                    artifact.target,
-                    artifact.library_crate_compilation_unit_hash,
-                    artifact.build_script_compilation_unit_hash,
-                    artifact.build_script_execution_unit_hash,
-                    content_hash
-                )
-                .fetch_one(&mut *tx)
-                .await?
-                .id;
-
-                // Insert each file.
-                for (file, key) in library_unit_files {
-                    let key = key.as_str();
-                    // Find or create CAS object.
-                    let object_id = match sqlx::query!(
-                        "SELECT id AS \"id!: i64\" FROM object WHERE key = $1",
-                        key
-                    )
-                    .fetch_optional(&mut *tx)
-                    .await?
-                    {
-                        Some(row) => row.id,
-                        None => {
-                            sqlx::query!("INSERT INTO object (key) VALUES ($1) RETURNING id", key)
-                                .fetch_one(&mut *tx)
-                                .await?
-                                .id
-                        }
-                    };
-
-                    // TODO: Would it be faster to gather this during the
-                    // walking?
-                    let metadata = fs::Metadata::from_file(&file)
-                        .await?
-                        .ok_or_eyre("could not stat file metadata")?;
-
-                    // We need to do this because SQLite does not support
-                    // 128-bit integers.
-                    let mtime_bytes = metadata
-                        .mtime
-                        .duration_since(UNIX_EPOCH)?
-                        .as_nanos()
-                        .to_be_bytes();
-                    let mtime_slice = mtime_bytes.as_slice();
-
-                    let filepath = file.to_string();
-
-                    sqlx::query!(
-                        r#"
-                        INSERT INTO library_unit_build_artifact (
-                            library_unit_build_id,
-                            object_id,
-                            path,
-                            mtime,
-                            executable
-                        ) VALUES ($1, $2, $3, $4, $5)
-                         "#,
-                        library_unit_build_id,
-                        object_id,
-                        filepath,
-                        mtime_slice,
-                        metadata.executable
-                    )
-                    .execute(&mut *tx)
-                    .await?;
-                }
-            }
-        };
-
-        tx.commit().await?;
-
-        Ok(())
+        self.courier.cargo_cache_save(request).await
     }
 
     #[instrument(name = "CargoCache::restore")]
     pub async fn restore(&self, artifact_plan: &ArtifactPlan) -> Result<()> {
         debug!("start restoring");
-        let mut artifact_tasks = JoinSet::new();
-        for artifact in &artifact_plan.artifacts {
-            let db = self.db.clone();
-            let cas = self.cas.clone();
-            let artifact = artifact.clone();
-            let artifact_plan = artifact_plan.clone();
-            artifact_tasks.spawn(async move {
-                // See if there are any saved artifacts that match.
-                let mut tx = db.begin().await?;
-                let unit_builds = sqlx::query!(
-                    r#"
-                    SELECT
-                        library_unit_build.id AS "id!: i64",
-                        library_unit_build.content_hash
-                    FROM package
-                    JOIN library_unit_build ON package.id = library_unit_build.package_id
-                    WHERE
-                        package.name = $1
-                        AND package.version = $2
-                        AND target = $3
-                        AND library_crate_compilation_unit_hash = $4
-                        AND COALESCE(build_script_compilation_unit_hash, '') = COALESCE($5, '')
-                        AND COALESCE(build_script_execution_unit_hash, '') = COALESCE($6, '')
-                    "#,
-                    artifact.package_name,
-                    artifact.package_version,
-                    artifact_plan.target,
-                    artifact.library_crate_compilation_unit_hash,
-                    artifact.build_script_compilation_unit_hash,
-                    artifact.build_script_execution_unit_hash
-                )
-                .fetch_all(&mut *tx)
-                .await?;
 
-                let unit_to_restore = match unit_builds.split_first() {
-                    // If there is one matching unit, just restore that one.
-                    Some((first, [])) => first.id,
-                    // If there are multiple matching library units, choose the
-                    // canonical unit to restore.
-                    //
-                    // TODO: We only do this today because our keys are
-                    // insufficiently precise (in particular, we aren't able to
-                    // key on predicted dynamic fields from build script
-                    // execution). We can probably do a lot better.
-                    Some((first, rest)) => {
-                        if rest
-                            .iter()
-                            .all(|unit| unit.content_hash == first.content_hash)
-                        {
-                            // If all the units have the same content hash, then
-                            // we can restore any of them. This should generally
-                            // not happen, but can occur sometimes due to cache
-                            // database corruption.
-                            first.id
-                        } else {
-                            // If there are any units with different content
-                            // hash, then we should emit a warning and choose
-                            // not to restore any of them.
-                            warn!(
-                                ?artifact,
-                                ?unit_builds,
-                                "multiple matching library unit builds found"
-                            );
-                            return Ok(());
-                        }
-                    }
-                    // If there are no matching library units, there's nothing
-                    // to restore.
-                    None => {
-                        debug!(?artifact, "no matching library unit build found");
-                        return Ok(());
-                    }
+        // Open the profile dir once to extract owned paths upfront.
+        // We do this because `ProfileDir` has a lifetime for the lock, so we can't send
+        // it to worker tasks; this is valid so long as we actually hold `ProfileDir`
+        // for the entire time the task workers live (which we do).
+        let profile_dir = self.ws.open_profile_locked(&artifact_plan.profile).await?;
+        let profile_root = profile_dir.root().to_owned();
+        let cargo_home = profile_dir.workspace.cargo_home.clone();
+
+        // TODO: We should probably make this concurrent on something else since this is
+        // likely going to be primarily blocked on network transfer.
+        let worker_count = num_cpus::get();
+
+        // Normally I don't like buffered channels, but here we let it buffer so that we
+        // can potentially start working on the next artifact_plan while the prior is
+        // still being worked on. We want to avoid uneccesary memory overhead but each
+        // individual artifact file is relatively small so we'd rather trade some space
+        // for latency mitigation here.
+        let (tx, rx) = flume::bounded::<ArtifactFile>(worker_count * 10);
+        let mut cas_restore_workers = JoinSet::new();
+        for _ in 0..worker_count {
+            let rx = rx.clone();
+            let cas = self.cas.clone();
+            let profile_root = profile_root.clone();
+            let cargo_home = cargo_home.clone();
+            cas_restore_workers.spawn(async move {
+                let restore = async move |artifact: &ArtifactFile| -> Result<()> {
+                    let key = Blake3::from_hex_string(&artifact.object_key)?;
+
+                    // Reconstruct the portable path to an absolute path for this machine.
+                    let path = artifact
+                        .path
+                        .reconstruct_raw(&profile_root, &cargo_home)
+                        .pipe(AbsFilePath::try_from)?;
+
+                    // Get the data from the CAS and reconstruct it according to the local machine.
+                    let data = cas.must_get(&key).await?;
+                    let data = Self::reconstruct(&profile_root, &cargo_home, &path, &data).await?;
+
+                    // Write the file.
+                    let mtime = UNIX_EPOCH + Duration::from_nanos(artifact.mtime_nanos as u64);
+                    let metadata = fs::Metadata::builder()
+                        .mtime(mtime)
+                        .executable(artifact.executable)
+                        .build();
+                    fs::write(&path, &data).await?;
+                    metadata.set_file(&path).await?;
+                    Result::<()>::Ok(())
                 };
 
-                // Restore the unit.
-                let objects = sqlx::query!(
-                    r#"
-                    SELECT
-                        object.key,
-                        library_unit_build_artifact.path,
-                        library_unit_build_artifact.mtime,
-                        library_unit_build_artifact.executable
-                    FROM library_unit_build_artifact
-                    JOIN object ON library_unit_build_artifact.object_id = object.id
-                    WHERE
-                        library_unit_build_artifact.library_unit_build_id = $1
-                    "#,
-                    unit_to_restore
-                )
-                .fetch_all(&mut *tx)
-                .await?;
-
-                let mut copy_tasks = JoinSet::new();
-                for object in objects {
-                    let cas = cas.clone();
-                    copy_tasks.spawn(async move {
-                        // TODO: Why is this backed by a String? Why don't we
-                        // store this as a BLOB?
-                        let key = Blake3::from_hex_string(&object.key)?;
-                        // TODO: Instead of reading and then writing, maybe we
-                        // should change the API shape to directly do a copy on
-                        // supported filesystems?
-                        let data = cas.must_get(&key).await?;
-                        // TODO: These are currently all absolute paths. We need
-                        // to implement relative path rewrites for portability.
-                        let path = AbsFilePath::try_from(object.path)?;
-                        let mtime = {
-                            let mtime_bytes: Result<[u8; 16], _> = object.mtime.try_into();
-                            let mtime_nanos = u128::from_be_bytes(
-                                mtime_bytes.or_else(|_| bail!("could not read mtime"))?,
-                            );
-                            // TODO: Is this conversion safe? It will truncate,
-                            // but probably not outside the range we care about.
-                            // Maybe we really should serialize to TEXT just to
-                            // get rid of this headache.
-                            UNIX_EPOCH + Duration::from_nanos(mtime_nanos as u64)
-                        };
-                        let metadata = fs::Metadata {
-                            mtime,
-                            executable: object.executable,
-                        };
-                        fs::write(&path, &data).await?;
-                        metadata.set_file(&path).await?;
-                        Ok::<(), Report>(())
-                    });
+                while let Ok(artifact) = rx.recv_async().await {
+                    if let Err(error) = restore(&artifact).await {
+                        warn!(?error, ?artifact, "failed to restore file");
+                    }
                 }
-                let results = copy_tasks.join_all().await;
-                for result in results {
-                    result?;
-                }
-                Ok::<(), Report>(())
             });
         }
-        let results = artifact_tasks.join_all().await;
-        for result in results {
-            result?;
+
+        for artifact in &artifact_plan.artifacts {
+            let request = CargoRestoreRequest::builder()
+                .package_name(&artifact.package_name)
+                .package_version(&artifact.package_version)
+                .target(&artifact_plan.target)
+                .library_crate_compilation_unit_hash(&artifact.library_crate_compilation_unit_hash)
+                .maybe_build_script_compilation_unit_hash(
+                    artifact.build_script_compilation_unit_hash.as_ref(),
+                )
+                .maybe_build_script_execution_unit_hash(
+                    artifact.build_script_execution_unit_hash.as_ref(),
+                )
+                .build();
+
+            let Some(response) = self.courier.cargo_cache_restore(request).await? else {
+                debug!(?artifact, "no matching library unit build found");
+                continue;
+            };
+
+            for artifact_file in response.artifacts {
+                if let Err(error) = tx.send_async(artifact_file).await {
+                    panic!("invariant violated: no restore workers are alive: {error:?}");
+                }
+            }
         }
+
+        // The channels are done being used here, so we drop them; the workers may still
+        // be using their clones if they're in process writing files but they'll keep
+        // rx alive until they're all done.
+        drop(rx);
+        drop(tx);
+        while let Some(worker) = cas_restore_workers.join_next().await {
+            worker.context("cas restore worker")?;
+        }
+
         debug!("done restoring");
         Ok(())
+    }
+
+    /// Rewrite file contents before storing in CAS to normalize paths.
+    #[instrument(name = "CargoCache::rewrite_for_storage", skip(content))]
+    async fn rewrite(
+        profile_dir: &ProfileDir<'_, Locked>,
+        path: &AbsFilePath,
+        content: &[u8],
+    ) -> Result<Vec<u8>> {
+        // Determine what kind of file this is based on path structure.
+        let components = path.component_strs_lossy().collect::<Vec<_>>();
+
+        // Look at the last few components to determine file type.
+        // We use .rev() to start from the filename and work backwards.
+        let file_type = components
+            .iter()
+            .rev()
+            .tuple_windows::<(_, _, _)>()
+            .find_map(|(name, parent, gparent)| {
+                let ext = name.as_ref().rsplit_once('.').map(|(_, ext)| ext);
+                match (gparent.as_ref(), parent.as_ref(), name.as_ref(), ext) {
+                    ("build", _, "output", _) => Some("build-script-output"),
+                    ("build", _, "root-output", _) => Some("root-output"),
+                    (_, _, _, Some("d")) => Some("dep-info"),
+                    _ => None,
+                }
+            });
+
+        match file_type {
+            Some("root-output") => {
+                trace!(?path, "rewriting root-output file");
+                let parsed = RootOutput::from_file(profile_dir, path).await?;
+                serde_json::to_vec(&parsed).context("serialize RootOutput")
+            }
+            Some("build-script-output") => {
+                trace!(?path, "rewriting build-script-output file");
+                let parsed = BuildScriptOutput::from_file(profile_dir, path).await?;
+                serde_json::to_vec(&parsed).context("serialize BuildScriptOutput")
+            }
+            Some("dep-info") => {
+                trace!(?path, "rewriting dep-info file");
+                let parsed = DepInfo::from_file(profile_dir, path).await?;
+                serde_json::to_vec(&parsed).context("serialize DepInfo")
+            }
+            None => {
+                // No rewriting needed, store as-is.
+                Ok(content.to_vec())
+            }
+            Some(unknown) => {
+                bail!("unknown file type for rewriting: {unknown}")
+            }
+        }
+    }
+
+    /// Reconstruct file contents after retrieving from CAS.
+    #[instrument(name = "CargoCache::reconstruct_from_storage", skip(content))]
+    async fn reconstruct(
+        profile_root: &AbsDirPath,
+        cargo_home: &AbsDirPath,
+        path: &AbsFilePath,
+        content: &[u8],
+    ) -> Result<Vec<u8>> {
+        use itertools::Itertools as _;
+
+        // Determine what kind of file this is based on path structure.
+        let components = path.component_strs_lossy().collect::<Vec<_>>();
+
+        // Look at the last few components to determine file type.
+        let file_type = components
+            .iter()
+            .rev()
+            .tuple_windows::<(_, _, _)>()
+            .find_map(|(name, parent, gparent)| {
+                let ext = name.as_ref().rsplit_once('.').map(|(_, ext)| ext);
+                match (gparent.as_ref(), parent.as_ref(), name.as_ref(), ext) {
+                    ("build", _, "output", _) => Some("build-script-output"),
+                    ("build", _, "root-output", _) => Some("root-output"),
+                    (_, _, _, Some("d")) => Some("dep-info"),
+                    _ => None,
+                }
+            });
+
+        match file_type {
+            Some("root-output") => {
+                trace!(?path, "reconstructing root-output file");
+                let parsed = serde_json::from_slice::<RootOutput>(content)?;
+                Ok(parsed
+                    .reconstruct_raw(profile_root, cargo_home)
+                    .into_bytes())
+            }
+            Some("build-script-output") => {
+                trace!(?path, "reconstructing build-script-output file");
+                let parsed = serde_json::from_slice::<BuildScriptOutput>(content)?;
+                Ok(parsed
+                    .reconstruct_raw(profile_root, cargo_home)
+                    .into_bytes())
+            }
+            Some("dep-info") => {
+                trace!(?path, "reconstructing dep-info file");
+                let parsed = serde_json::from_slice::<DepInfo>(content)?;
+                Ok(parsed
+                    .reconstruct_raw(profile_root, cargo_home)
+                    .into_bytes())
+            }
+            None => {
+                // No reconstruction needed, use as-is.
+                Ok(content.to_vec())
+            }
+            Some(unknown) => {
+                bail!("unknown file type for reconstruction: {unknown}")
+            }
+        }
     }
 }
 
@@ -872,14 +794,6 @@ impl LibraryUnitHash {
 mod tests {
     use super::*;
     use pretty_assertions::assert_eq as pretty_assert_eq;
-
-    #[sqlx::test(migrator = "crate::cargo::cache::CargoCache::MIGRATOR")]
-    async fn open_test_database(pool: SqlitePool) {
-        sqlx::query("select 1")
-            .fetch_one(&pool)
-            .await
-            .expect("select 1");
-    }
 
     #[tokio::test]
     async fn build_plan_flag_order_does_not_matter() {
