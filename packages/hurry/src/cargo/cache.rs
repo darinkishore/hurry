@@ -9,7 +9,7 @@ use std::{
 use cargo_metadata::TargetKind;
 use color_eyre::{
     Result,
-    eyre::{Context as _, OptionExt, bail},
+    eyre::{Context as _, OptionExt, bail, eyre},
 };
 use futures::TryStreamExt as _;
 use itertools::Itertools;
@@ -98,11 +98,12 @@ impl CargoCache {
         let mut artifacts = Vec::new();
         for (i, invocation) in build_plan.invocations.iter().cloned().enumerate() {
             trace!(?invocation, "build plan invocation");
+
             // For each invocation, figure out what kind it is:
             // 1. Compiling a build script.
             // 2. Running a build script.
             // 3. Compiling a dependency.
-            // 4. Compiling first-party code.
+            // 4. Compiling first-party code (which we skip for caching).
             if invocation.target_kind == [TargetKind::CustomBuild] {
                 match invocation.compile_mode {
                     CargoCompileMode::Build => {
@@ -170,6 +171,17 @@ impl CargoCache {
                 || invocation.target_kind.contains(&TargetKind::CDyLib)
                 || invocation.target_kind.contains(&TargetKind::ProcMacro)
             {
+                // Skip first-party workspace members. We only cache third-party dependencies.
+                // `CARGO_PRIMARY_PACKAGE` is set if the user specifically requested the item
+                // to be built; while it's technically possible for the user to do so for a
+                // third-party dependency that's relatively rare (and arguably if they're asking
+                // to compile it specifically, it _should_ probably be exempt from cache).
+                let primary = invocation.env.get("CARGO_PRIMARY_PACKAGE");
+                if primary.map(|v| v.as_str()) == Some("1") {
+                    trace!(?invocation, "skipping: first party workspace member");
+                    continue;
+                }
+
                 // Sanity check: everything here should be a dependency being compiled.
                 if invocation.compile_mode != CargoCompileMode::Build {
                     bail!(
@@ -211,7 +223,11 @@ impl CargoCache {
 
                     filename
                         .rsplit_once('-')
-                        .ok_or_eyre("no unit hash suffix")?
+                        .ok_or_else(|| {
+                            eyre!(
+                                "no unit hash suffix in filename: {filename} (all files: {lib_files:?})"
+                            )
+                        })?
                         .1
                         .to_string()
                 };
@@ -423,13 +439,13 @@ impl CargoCache {
                     artifact_files.push(
                         ArtifactFile::builder()
                             .object_key(key.to_string())
-                            .path(portable)
+                            .path(portable.clone())
                             .mtime_nanos(mtime_nanos)
                             .executable(metadata.executable)
                             .build(),
                     );
 
-                    library_unit_files.push((path, key));
+                    library_unit_files.push((portable, key));
                 }
                 None => {
                     // Note that this is not necessarily incorrect! For example,
@@ -775,7 +791,7 @@ impl BuiltArtifact {
 /// A content hash of a library unit's artifacts.
 #[derive(Clone, Eq, PartialEq, Hash, Debug, Serialize)]
 struct LibraryUnitHash {
-    files: Vec<(AbsFilePath, Blake3)>,
+    files: Vec<(QualifiedPath, Blake3)>,
 }
 
 impl LibraryUnitHash {
@@ -784,7 +800,7 @@ impl LibraryUnitHash {
     /// This constructor always ensures that the files are sorted, so any two
     /// sets of files with the same paths and contents will produce the same
     /// hash.
-    fn new(mut files: Vec<(AbsFilePath, Blake3)>) -> Self {
+    fn new(mut files: Vec<(QualifiedPath, Blake3)>) -> Self {
         files.sort();
         Self { files }
     }
