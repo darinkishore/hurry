@@ -3,6 +3,10 @@ use std::{
     fmt::Debug,
     io::Write,
     path::PathBuf,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
     time::{Duration, UNIX_EPOCH},
 };
 
@@ -11,12 +15,17 @@ use color_eyre::{
     Result,
     eyre::{Context as _, OptionExt, bail, eyre},
 };
+use dashmap::DashSet;
 use futures::TryStreamExt as _;
+use humansize::{DECIMAL, format_size};
+use indicatif::ProgressBar;
 use itertools::Itertools;
+use scopeguard::defer;
 use serde::Serialize;
 use tap::Pipe as _;
 use tokio::task::JoinSet;
 use tracing::{debug, instrument, trace, warn};
+use uuid::Uuid;
 
 use crate::{
     Locked,
@@ -32,6 +41,51 @@ use crate::{
     path::{AbsDirPath, AbsFilePath, JoinWith, TryJoinWith as _},
 };
 
+/// Statistics about cache operations.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct CacheStats {
+    pub files: u64,
+    pub bytes: u64,
+}
+
+/// Tracks items that were restored from the cache.
+#[derive(Debug, Clone, Default)]
+pub struct RestoreState {
+    pub artifacts: DashSet<ArtifactKey>,
+    pub objects: DashSet<Blake3>,
+    pub stats: CacheStats,
+}
+
+impl RestoreState {
+    /// Records that an artifact was restored from cache.
+    fn record_artifact(&self, artifact: &ArtifactKey) {
+        self.artifacts.insert(artifact.clone());
+    }
+
+    /// Records that an object was restored from cache.
+    fn record_object(&self, key: &Blake3) {
+        self.objects.insert(key.clone());
+    }
+
+    /// Checks if an artifact was restored from cache.
+    fn check_artifact(&self, artifact: &ArtifactKey) -> bool {
+        self.artifacts.contains(artifact)
+    }
+
+    /// Checks if an object was restored from cache.
+    fn check_object(&self, key: &Blake3) -> bool {
+        self.objects.contains(key)
+    }
+
+    fn with_stats(self, stats: CacheStats) -> Self {
+        Self {
+            artifacts: self.artifacts,
+            objects: self.objects,
+            stats,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct CargoCache {
     courier: Courier,
@@ -44,6 +98,44 @@ impl CargoCache {
     pub async fn open(courier: Courier, ws: Workspace) -> Result<Self> {
         let cas = CourierCas::new(courier.clone());
         Ok(Self { cas, courier, ws })
+    }
+
+    /// Get the build plan by running `cargo build --build-plan` with the
+    /// provided arguments.
+    async fn build_plan(&self, args: impl AsRef<CargoBuildArguments> + Debug) -> Result<BuildPlan> {
+        // Running `cargo build --build-plan` deletes a bunch of items in the `target`
+        // directory. To work around this we temporarily move `target` -> run
+        // the build plan -> move it back. If the rename fails (e.g., permissions,
+        // cross-device), we proceed without it; this will then have the original issue
+        // but at least won't break the build.
+        let temp = self
+            .ws
+            .root
+            .as_std_path()
+            .join(format!("target.backup.{}", Uuid::new_v4()));
+
+        let renamed = tokio::fs::rename(self.ws.target.as_std_path(), &temp)
+            .await
+            .is_ok();
+
+        defer! {
+            if renamed {
+                let target = self.ws.target.as_std_path();
+                let _ = std::fs::remove_dir_all(target);
+                let _ = std::fs::rename(&temp, target);
+            }
+        }
+
+        let mut build_args = args.as_ref().to_argv();
+        build_args.extend([
+            String::from("--build-plan"),
+            String::from("-Z"),
+            String::from("unstable-options"),
+        ]);
+        cargo::invoke_output("build", build_args, [("RUSTC_BOOTSTRAP", "1")])
+            .await?
+            .pipe(|output| serde_json::from_slice::<BuildPlan>(&output.stdout))
+            .context("parse build plan")
     }
 
     #[instrument(name = "CargoCache::artifacts")]
@@ -77,20 +169,7 @@ impl CargoCache {
         // pass the flags but we pass the user flags first just in case as that
         // seems like it'd follow the principle of least surprise if ordering
         // ever does matter.
-        //
-        // FIXME: Why does running this clear all the compiled artifacts from
-        // the target folder?
-        let mut build_args = args.as_ref().to_argv();
-        build_args.extend([
-            String::from("--build-plan"),
-            String::from("-Z"),
-            String::from("unstable-options"),
-        ]);
-
-        let build_plan = cargo::invoke_output("build", build_args, [("RUSTC_BOOTSTRAP", "1")])
-            .await?
-            .pipe(|output| serde_json::from_slice::<BuildPlan>(&output.stdout))
-            .context("parsing build plan")?;
+        let build_plan = self.build_plan(&args).await?;
         trace!(?build_plan, "build plan");
 
         let mut build_script_index_to_dir = HashMap::new();
@@ -345,10 +424,18 @@ impl CargoCache {
         })
     }
 
-    #[instrument(name = "CargoCache::save")]
-    pub async fn save(&self, artifact_plan: ArtifactPlan) -> Result<()> {
+    #[instrument(name = "CargoCache::save", skip(progress))]
+    pub async fn save(
+        &self,
+        artifact_plan: ArtifactPlan,
+        progress: &ProgressBar,
+        restored: &RestoreState,
+    ) -> Result<CacheStats> {
         let target_dir = self.ws.open_profile_locked(&artifact_plan.profile).await?;
         let target_path = target_dir.root();
+
+        let mut transferred_files = 0u64;
+        let mut transferred_bytes = 0u64;
 
         for artifact in artifact_plan.artifacts {
             // TODO: The fact that this takes a `ProfileDir` is an expedient
@@ -357,6 +444,8 @@ impl CargoCache {
             // upstream consumers (e.g. `BuildScriptOutput::from_file`).
             let artifact = BuiltArtifact::from_key(&target_dir, artifact).await?;
             debug!(?artifact, "caching artifact");
+
+            let artifact_key = artifact.reconstruct_key();
 
             // Determine which files will be saved.
             let lib_files = {
@@ -421,7 +510,22 @@ impl CargoCache {
                 }
                 None => vec![],
             };
+
             let files_to_save = lib_files.into_iter().chain(build_script_files);
+            if restored.check_artifact(&artifact_key) {
+                trace!(
+                    ?artifact_key,
+                    "skipping backup: artifact was restored from cache"
+                );
+                transferred_files += files_to_save.count() as u64;
+                progress.inc(1);
+                progress.set_message(format!(
+                    "Backing up cache ({} files, {} transferred)",
+                    transferred_files,
+                    format_size(transferred_bytes, DECIMAL)
+                ));
+                continue;
+            }
 
             // For each file, save it into the CAS and calculate its key.
             //
@@ -433,9 +537,21 @@ impl CargoCache {
                 match fs::read_buffered(&path).await? {
                     Some(content) => {
                         let content = Self::rewrite(&target_dir, &path, &content).await?;
+                        let key = Blake3::from_buffer(&content);
 
-                        let key = self.cas.store(&content).await?;
-                        debug!(?path, ?key, "stored object");
+                        // Don't even check if it already exists in the CAS if we restored it.
+                        let (key, uploaded) = if restored.check_object(&key) {
+                            trace!(?path, ?key, "skipping backup: file was restored from cache");
+                            (key, false)
+                        } else {
+                            self.cas.store(&content).await?
+                        };
+
+                        if uploaded {
+                            transferred_bytes += content.len() as u64;
+                        }
+                        transferred_files += 1;
+                        debug!(?path, ?key, uploaded, "stored object");
 
                         // Gather metadata for the artifact file.
                         let metadata = fs::Metadata::from_file(&path)
@@ -490,13 +606,26 @@ impl CargoCache {
                 .build();
 
             self.courier.cargo_cache_save(request).await?;
+            progress.inc(1);
+            progress.set_message(format!(
+                "Backing up cache ({} files, {} transferred)",
+                transferred_files,
+                format_size(transferred_bytes, DECIMAL)
+            ));
         }
 
-        Ok(())
+        Ok(CacheStats {
+            files: transferred_files,
+            bytes: transferred_bytes,
+        })
     }
 
-    #[instrument(name = "CargoCache::restore")]
-    pub async fn restore(&self, artifact_plan: &ArtifactPlan) -> Result<()> {
+    #[instrument(name = "CargoCache::restore", skip(progress))]
+    pub async fn restore(
+        &self,
+        artifact_plan: &ArtifactPlan,
+        progress: &ProgressBar,
+    ) -> Result<RestoreState> {
         debug!("start restoring");
 
         // Open the profile dir once to extract owned paths upfront.
@@ -516,6 +645,9 @@ impl CargoCache {
         // still being worked on. We want to avoid uneccesary memory overhead but each
         // individual artifact file is relatively small so we'd rather trade some space
         // for latency mitigation here.
+        let restored = RestoreState::default();
+        let transferred_files = Arc::new(AtomicU64::new(0));
+        let transferred_bytes = Arc::new(AtomicU64::new(0));
         let (tx, rx) = flume::bounded::<ArtifactFile>(worker_count * 10);
         let mut cas_restore_workers = JoinSet::new();
         for _ in 0..worker_count {
@@ -523,12 +655,15 @@ impl CargoCache {
             let cas = self.cas.clone();
             let profile_root = profile_root.clone();
             let cargo_home = cargo_home.clone();
+            let transferred_files = transferred_files.clone();
+            let transferred_bytes = transferred_bytes.clone();
+            let restored = restored.clone();
             cas_restore_workers.spawn(async move {
-                let restore = async move |artifact: &ArtifactFile| -> Result<()> {
-                    let key = Blake3::from_hex_string(&artifact.object_key)?;
+                let restore = async move |file: &ArtifactFile| -> Result<u64> {
+                    let key = Blake3::from_hex_string(&file.object_key)?;
 
                     // Reconstruct the portable path to an absolute path for this machine.
-                    let path = artifact
+                    let path = file
                         .path
                         .reconstruct_raw(&profile_root, &cargo_home)
                         .pipe(AbsFilePath::try_from)?;
@@ -538,7 +673,7 @@ impl CargoCache {
                         let existing_hash = Blake3::from_file(&path).await?;
                         if existing_hash == key {
                             trace!(?path, "file already exists with correct hash, skipping");
-                            return Ok(());
+                            return Ok(0);
                         }
                     }
 
@@ -547,19 +682,26 @@ impl CargoCache {
                     let data = Self::reconstruct(&profile_root, &cargo_home, &path, &data).await?;
 
                     // Write the file.
-                    let mtime = UNIX_EPOCH + Duration::from_nanos(artifact.mtime_nanos as u64);
+                    let mtime = UNIX_EPOCH + Duration::from_nanos(file.mtime_nanos as u64);
                     let metadata = fs::Metadata::builder()
                         .mtime(mtime)
-                        .executable(artifact.executable)
+                        .executable(file.executable)
                         .build();
                     fs::write(&path, &data).await?;
                     metadata.set_file(&path).await?;
-                    Result::<()>::Ok(())
+                    restored.record_object(&key);
+                    Result::<u64>::Ok(data.len() as u64)
                 };
 
-                while let Ok(artifact) = rx.recv_async().await {
-                    if let Err(error) = restore(&artifact).await {
-                        warn!(?error, ?artifact, "failed to restore file");
+                while let Ok(file) = rx.recv_async().await {
+                    match restore(&file).await {
+                        Ok(transferred) => {
+                            transferred_files.fetch_add(1, Ordering::Relaxed);
+                            transferred_bytes.fetch_add(transferred, Ordering::Relaxed);
+                        }
+                        Err(error) => {
+                            warn!(?error, ?file, "failed to restore file");
+                        }
                     }
                 }
             });
@@ -581,14 +723,24 @@ impl CargoCache {
 
             let Some(response) = self.courier.cargo_cache_restore(request).await? else {
                 debug!(?artifact, "no matching library unit build found");
+                progress.inc(1);
                 continue;
             };
 
+            // Send all files for this package to workers.
             for artifact_file in response.artifacts {
                 if let Err(error) = tx.send_async(artifact_file).await {
                     panic!("invariant violated: no restore workers are alive: {error:?}");
                 }
             }
+
+            restored.record_artifact(artifact);
+            progress.inc(1);
+            progress.set_message(format!(
+                "Restoring cache ({} files, {} transferred)",
+                transferred_files.load(Ordering::Relaxed),
+                format_size(transferred_bytes.load(Ordering::Relaxed), DECIMAL)
+            ));
         }
 
         // The channels are done being used here, so we drop them; the workers may still
@@ -596,12 +748,16 @@ impl CargoCache {
         // rx alive until they're all done.
         drop(rx);
         drop(tx);
+
         while let Some(worker) = cas_restore_workers.join_next().await {
             worker.context("cas restore worker")?;
         }
 
         debug!("done restoring");
-        Ok(())
+        Ok(restored.with_stats(CacheStats {
+            files: transferred_files.load(Ordering::Relaxed),
+            bytes: transferred_bytes.load(Ordering::Relaxed),
+        }))
     }
 
     /// Rewrite file contents before storing in CAS to normalize paths.
@@ -793,7 +949,7 @@ impl BuiltArtifact {
         let build_script_output = match &key.build_script_files {
             Some(build_script_files) => {
                 let bso = BuildScriptOutput::from_file(
-                    &profile,
+                    profile,
                     &build_script_files.output_dir.join(mk_rel_file!("output")),
                 )
                 .await?;
@@ -816,6 +972,19 @@ impl BuiltArtifact {
             build_script_execution_unit_hash: key.build_script_execution_unit_hash,
             build_script_output,
         })
+    }
+
+    /// Reconstruct a representative `ArtifactKey`.
+    pub fn reconstruct_key(&self) -> ArtifactKey {
+        ArtifactKey {
+            package_name: self.package_name.clone(),
+            package_version: self.package_version.clone(),
+            lib_files: self.lib_files.clone(),
+            build_script_files: self.build_script_files.clone(),
+            library_crate_compilation_unit_hash: self.library_crate_compilation_unit_hash.clone(),
+            build_script_compilation_unit_hash: self.build_script_compilation_unit_hash.clone(),
+            build_script_execution_unit_hash: self.build_script_execution_unit_hash.clone(),
+        }
     }
 }
 
