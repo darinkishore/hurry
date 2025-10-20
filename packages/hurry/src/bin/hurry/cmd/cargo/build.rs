@@ -44,6 +44,10 @@ pub struct Options {
     #[arg(long = "hurry-skip-restore", default_value_t = false)]
     skip_restore: bool,
 
+    /// Emit debug timings.
+    #[arg(long = "hurry-timings", default_value_t = false, hide(true))]
+    timings: bool,
+
     /// These arguments are passed directly to `cargo build` as provided.
     #[arg(
         num_args = ..,
