@@ -17,7 +17,7 @@ permissions:
 
 jobs:
   tagged:
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-4vcpu-ubuntu-2404
 
     outputs:
       sha: ${{ steps.compute.outputs.sha }}
@@ -185,7 +185,7 @@ jobs:
   create-checksums:
     name: checksums
     needs: build
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     steps:
       - uses: actions/download-artifact@v4
         with:
@@ -207,7 +207,7 @@ jobs:
   release:
     name: push
     needs: [tagged, build, create-checksums]
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     steps:
       - uses: actions/download-artifact@v4
         with:

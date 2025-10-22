@@ -7,7 +7,7 @@ on:
 
 jobs:
   build-hurry:
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-4vcpu-ubuntu-2404
 
     steps:
       - uses: actions/checkout@v4
@@ -24,7 +24,7 @@ jobs:
           path: target/release/hurry
 
   clean:
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     outputs:
       duration: ${{ steps.build.outputs.duration }}
 
@@ -42,7 +42,7 @@ jobs:
           echo "duration=$DURATION" >> $GITHUB_OUTPUT
 
   hurry:
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     needs: [build-hurry]
     outputs:
       duration: ${{ steps.build.outputs.duration }}
@@ -68,7 +68,7 @@ jobs:
           echo "duration=$DURATION" >> $GITHUB_OUTPUT
 
   swatinem:
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     outputs:
       duration: ${{ steps.build.outputs.duration }}
 
@@ -89,7 +89,7 @@ jobs:
           echo "duration=$DURATION" >> $GITHUB_OUTPUT
 
   sccache:
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     outputs:
       duration: ${{ steps.build.outputs.duration }}
 
@@ -114,7 +114,7 @@ jobs:
 
   summary:
     name: Benchmark
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     needs: [clean, hurry, swatinem, sccache]
 
     steps:
