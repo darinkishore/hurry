@@ -41,8 +41,14 @@ struct TopLevelFlags {
 #[derive(Clone, Debug, Subcommand)]
 enum Command {
     /// Fast `cargo` builds
-    #[clap(subcommand)]
-    Cargo(cmd::cargo::Command),
+    #[command(disable_help_flag = true, disable_version_flag = true)]
+    Cargo {
+        // We do it this way instead of constructing subcommands "the clap way" because
+        // we want to passthrough things like `help` and `version` to cargo instead of
+        // having clap intercept them.
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
 
     // TODO: /// Manage remote authentication
     // Auth,
@@ -77,16 +83,10 @@ async fn main() -> Result<()> {
                 cmd::cache::reset::exec(opts).await
             }
         },
-        Command::Cargo(cmd) => match cmd {
-            cmd::cargo::Command::Build(opts) => {
-                logger.init();
-                cmd::cargo::build::exec(opts).await
-            }
-            cmd::cargo::Command::Run(opts) => {
-                logger.init();
-                cmd::cargo::run::exec(opts).await
-            }
-        },
+        Command::Cargo { args } => {
+            logger.init();
+            cmd::cargo::exec(args).await
+        }
         Command::Debug(cmd) => match cmd {
             cmd::debug::Command::Metadata(opts) => {
                 logger.init();

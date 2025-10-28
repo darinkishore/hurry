@@ -1,5 +1,7 @@
 # Workflows that run on pull requests. These are primarily CI checks for
 # linting, formatting, testing, etc.
+#
+# TODO: Swap to hurry for caching!
 name: PR
 
 on:
@@ -48,7 +50,6 @@ jobs:
             - uses: taiki-e/install-action@nextest
             - uses: actions/checkout@v4
 
-            # TODO: Swap to `hurry`!
             - uses: Swatinem/rust-cache@v2
 
             - name: Check format
@@ -56,6 +57,9 @@ jobs:
 
             - name: Check clippy
               run: cargo clippy -p hurry -p courier
+
+            - name: Setup hurry-dev
+              uses: ./.github/actions/hurry-dev
 
             - name: Run tests
               run: cargo nextest run -p hurry -p courier

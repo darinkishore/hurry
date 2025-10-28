@@ -19,7 +19,15 @@ use url::Url;
 /// Options for `cargo build`.
 //
 // Hurry options are prefixed with `hurry-` to disambiguate from `cargo` args.
+//
+// TODO: When we implemented passthrough support for subcommands, we hid the `hurry` help
+// documentation in favor of showing users Cargo's documentation; this was done in order to make it
+// easier to use `hurry cargo` as an alias for `cargo` in onboarding teams. However, this might be
+// confusing as teams onboard or as our set of options grows. We probably want to implement a custom
+// help function that extracts the current help output from `cargo` and then blends it with `hurry`
+// specific help so that users get both sets of options.
 #[derive(Clone, Args, Debug)]
+#[command(disable_help_flag = true)]
 pub struct Options {
     /// Base URL for the Courier instance.
     #[arg(
@@ -58,10 +66,22 @@ impl Options {
     pub fn parsed_args(&self) -> CargoBuildArguments {
         CargoBuildArguments::from_iter(&self.argv)
     }
+
+    /// Check if help is requested in the arguments.
+    pub fn is_help_request(&self) -> bool {
+        self.argv
+            .iter()
+            .any(|arg| matches!(arg.as_str(), "--help" | "-h"))
+    }
 }
 
 #[instrument]
 pub async fn exec(options: Options) -> Result<()> {
+    // If help is requested, passthrough directly to cargo to show cargo's help
+    if options.is_help_request() {
+        return cargo::invoke("build", &options.argv).await;
+    }
+
     info!("Starting");
 
     // Parse and validate cargo build arguments.
