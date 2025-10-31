@@ -2,7 +2,7 @@ use std::{collections::HashMap, fmt::Debug, path::PathBuf};
 
 use cargo_metadata::TargetKind;
 use color_eyre::{
-    Result,
+    Result, Section, SectionExt,
     eyre::{Context, OptionExt as _, bail, eyre},
 };
 use derive_more::{Debug as DebugExt, Display};
@@ -16,7 +16,7 @@ use uuid::Uuid;
 use crate::{
     cargo::{
         self, BuildPlan, BuildScriptOutput, CargoBuildArguments, CargoCompileMode, Profile,
-        QualifiedPath, RustcMetadata,
+        QualifiedPath, RustcMetadata, build_plan::RustcInvocationArgument,
     },
     mk_rel_file,
     path::{AbsDirPath, AbsFilePath, JoinWith as _, TryJoinWith as _},
@@ -160,10 +160,21 @@ impl Workspace {
             String::from("-Z"),
             String::from("unstable-options"),
         ]);
-        cargo::invoke_output("build", build_args, [("RUSTC_BOOTSTRAP", "1")])
-            .await?
-            .pipe(|output| serde_json::from_slice::<BuildPlan>(&output.stdout))
+        let output = cargo::invoke_output("build", build_args, [("RUSTC_BOOTSTRAP", "1")])
+            .await
+            .context("run cargo command")?;
+        serde_json::from_slice::<BuildPlan>(&output.stdout)
             .context("parse build plan")
+            .with_section(move || {
+                String::from_utf8_lossy(&output.stdout)
+                    .to_string()
+                    .header("Stdout:")
+            })
+            .with_section(move || {
+                String::from_utf8_lossy(&output.stderr)
+                    .to_string()
+                    .header("Stderr:")
+            })
     }
 
     #[instrument(name = "Workspace::artifact_plan")]
@@ -440,14 +451,22 @@ impl Workspace {
             }
         }
 
+        // Extract the target from the rustc invocations. All artifacts in a single
+        // build use the same target, so we just need to find the first one.
+        let target = build_plan
+            .invocations
+            .iter()
+            .find_map(|invocation| {
+                invocation.args.iter().find_map(|arg| match arg {
+                    RustcInvocationArgument::Target(target) => Some(target.clone()),
+                    _ => None,
+                })
+            })
+            .unwrap_or_else(|| rustc.host_target.clone());
+
         Ok(ArtifactPlan {
             artifacts,
-            // TODO: We assume it's the same target as the host, but we really
-            // should be parsing this from the `rustc` invocation.
-            //
-            // TODO: Is it possible for different artifacts in the same build to
-            // have different targets?
-            target: rustc.host_target.clone(),
+            target,
             profile: profile.clone(),
         })
     }
