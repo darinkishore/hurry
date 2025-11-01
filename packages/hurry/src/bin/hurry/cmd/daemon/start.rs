@@ -1,6 +1,17 @@
-use std::{collections::HashSet, io::Write, sync::Arc, time::UNIX_EPOCH};
+use std::{
+    collections::HashSet,
+    io::Write,
+    sync::Arc,
+    time::{Duration, UNIX_EPOCH},
+};
 
-use axum::{Json, Router, extract::State, routing::post};
+use axum::{
+    Json, Router,
+    extract::{Request, State},
+    middleware::{self, Next},
+    response::Response,
+    routing::post,
+};
 use clap::Args;
 use color_eyre::{
     Result, Section, SectionExt,
@@ -35,11 +46,13 @@ use hurry::{
     cas::CourierCas,
     daemon::{
         CargoUploadRequest, CargoUploadResponse, CargoUploadStatus, CargoUploadStatusRequest,
-        CargoUploadStatusResponse, DaemonPaths, DaemonReadyMessage,
+        CargoUploadStatusResponse, DaemonPaths, DaemonReadyMessage, IdleState,
     },
     fs,
     path::{AbsFilePath, TryJoinWith},
 };
+
+const IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 
 #[derive(Clone, Args, Debug)]
 pub struct Options {
@@ -163,9 +176,11 @@ pub async fn exec(
 
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
+    let idle = IdleState::new(IDLE_TIMEOUT);
     let state = ServerState {
         uploads: DashMap::new().into(),
-        shutdown_tx,
+        shutdown_tx: shutdown_tx.clone(),
+        idle: idle.clone(),
     };
 
     let cargo = Router::new()
@@ -176,7 +191,11 @@ pub async fn exec(
     let app = Router::new()
         .nest("/api/v0/cargo", cargo)
         .route("/api/v0/shutdown", post(shutdown))
-        .with_state(state)
+        .with_state(state.clone())
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            track_activity_middleware,
+        ))
         .layer(TraceLayer::new_for_http());
 
     // Print ready message to STDOUT for parent processes. This uses `println!`
@@ -198,7 +217,7 @@ pub async fn exec(
     // We don't immediately handle the error with `?` here so that we can perform
     // the cleanup operations regardless of whether an error occurred.
     let served = axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal(shutdown_rx))
+        .with_graceful_shutdown(shutdown_signal(idle, shutdown_rx))
         .await
         .context("start server");
 
@@ -219,9 +238,19 @@ pub async fn exec(
     served
 }
 
+/// Middleware to track activity on every request.
+async fn track_activity_middleware(
+    State(state): State<ServerState>,
+    request: Request,
+    next: Next,
+) -> Response {
+    state.idle.touch();
+    next.run(request).await
+}
+
 /// Wait for a shutdown signal from either OS signals (SIGINT/SIGTERM) or the
 /// explicit shutdown channel.
-async fn shutdown_signal(mut shutdown_rx: watch::Receiver<bool>) {
+async fn shutdown_signal(idle: IdleState, mut shutdown_rx: watch::Receiver<bool>) {
     let ctrl_c = async {
         signal::ctrl_c()
             .await
@@ -253,6 +282,9 @@ async fn shutdown_signal(mut shutdown_rx: watch::Receiver<bool>) {
         _ = explicit_shutdown => {
             info!("received explicit shutdown request, starting graceful shutdown");
         },
+        _ = idle.monitor() => {
+            info!("idle timeout reached, starting graceful shutdown");
+        }
     }
 }
 
@@ -260,6 +292,7 @@ async fn shutdown_signal(mut shutdown_rx: watch::Receiver<bool>) {
 struct ServerState {
     uploads: Arc<DashMap<Uuid, CargoUploadStatus>>,
     shutdown_tx: watch::Sender<bool>,
+    idle: IdleState,
 }
 
 #[instrument]
@@ -346,6 +379,7 @@ async fn upload(
 
                 courier.cargo_cache_save(request).await?;
                 uploaded_artifacts += 1;
+                state.idle.touch();
                 state.uploads.insert(
                     request_id,
                     CargoUploadStatus::InProgress {
@@ -360,6 +394,8 @@ async fn upload(
             Result::<_>::Ok(())
         }
         .await;
+
+        state.idle.touch();
         match upload {
             Ok(()) => {
                 info!(?request_id, "upload completed successfully");
