@@ -142,7 +142,7 @@ pub async fn exec(
 
     let idle = IdleState::new(IDLE_TIMEOUT);
     let state = ServerState {
-        cargo: CargoDaemonState::default(),
+        cargo: CargoDaemonState::new(idle.clone()),
         shutdown_tx,
         idle: idle.clone(),
     };

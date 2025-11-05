@@ -15,18 +15,21 @@ use uuid::Uuid;
 use crate::{
     cargo::{ArtifactKey, ArtifactPlan, SaveProgress, Workspace, save_artifacts},
     cas::CourierCas,
+    daemon::IdleState,
 };
 use clients::{Courier, courier::v1::Key};
 
 #[derive(Debug, Clone)]
 pub struct CargoDaemonState {
     uploads: Arc<DashMap<Uuid, CargoUploadStatus>>,
+    pub idle: IdleState,
 }
 
-impl Default for CargoDaemonState {
-    fn default() -> Self {
+impl CargoDaemonState {
+    pub fn new(idle: IdleState) -> Self {
         Self {
             uploads: Arc::new(DashMap::new()),
+            idle,
         }
     }
 }
@@ -82,6 +85,7 @@ async fn upload(
                 &skip_artifacts,
                 &skip_objects,
                 |progress| {
+                    state.idle.touch();
                     state
                         .uploads
                         .insert(request_id, CargoUploadStatus::InProgress(progress.clone()));
@@ -90,6 +94,7 @@ async fn upload(
             .await
         }
         .await;
+        state.idle.touch();
         match upload {
             Ok(()) => {
                 info!(?request_id, "upload completed successfully");

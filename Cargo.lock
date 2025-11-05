@@ -2282,6 +2282,7 @@ name = "hurry"
 version = "0.0.0"
 dependencies = [
  "async-walkdir",
+ "atomic-time",
  "axum",
  "blake3",
  "bon",
