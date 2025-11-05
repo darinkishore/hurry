@@ -1,0 +1,214 @@
+//! Builds Cargo projects using cross with an optimized cache.
+//!
+//! Reference:
+//! - `docs/DESIGN.md`
+//! - `docs/development/cargo.md`
+
+use clap::Args;
+use color_eyre::{Result, eyre::Context};
+use derive_more::Debug;
+use tracing::{debug, info, instrument, warn};
+use url::Url;
+
+use hurry::{
+    cargo::{CargoBuildArguments, CargoCache, Profile, Workspace},
+    cross,
+    progress::TransferBar,
+};
+
+/// Options for `cross build`.
+//
+// Hurry options are prefixed with `hurry-` to disambiguate from `cross` args.
+//
+// TODO: When we implemented passthrough support for subcommands, we hid the `hurry` help
+// documentation in favor of showing users Cross's documentation; this was done in order to make it
+// easier to use `hurry cross` as an alias for `cross` in onboarding teams. However, this might be
+// confusing as teams onboard or as our set of options grows. We probably want to implement a custom
+// help function that extracts the current help output from `cross` and then blends it with `hurry`
+// specific help so that users get both sets of options.
+#[derive(Clone, Args, Debug)]
+#[command(disable_help_flag = true)]
+pub struct Options {
+    /// Base URL for the Courier instance.
+    #[arg(
+        long = "hurry-courier-url",
+        env = "HURRY_COURIER_URL",
+        default_value = "https://courier.staging.corp.attunehq.com"
+    )]
+    #[debug("{courier_url}")]
+    courier_url: Url,
+
+    /// Skip backing up the cache.
+    #[arg(long = "hurry-skip-backup", default_value_t = false)]
+    skip_backup: bool,
+
+    /// Skip the Cross build, only performing the cache actions.
+    #[arg(long = "hurry-skip-build", default_value_t = false)]
+    skip_build: bool,
+
+    /// Skip restoring the cache.
+    #[arg(long = "hurry-skip-restore", default_value_t = false)]
+    skip_restore: bool,
+
+    /// Wait for all new artifacts to upload to cache to finish before exiting.
+    #[arg(long = "hurry-wait-for-upload", default_value_t = false)]
+    wait_for_upload: bool,
+
+    /// Show help for `hurry cross build`.
+    #[arg(long = "hurry-help", default_value_t = false)]
+    pub help: bool,
+
+    /// These arguments are passed directly to `cross build` as provided.
+    #[arg(
+        num_args = ..,
+        trailing_var_arg = true,
+        allow_hyphen_values = true,
+        value_name = "ARGS",
+    )]
+    argv: Vec<String>,
+}
+
+impl Options {
+    /// Parse the cargo build arguments.
+    #[instrument(name = "Options::parsed_args")]
+    pub fn parsed_args(&self) -> CargoBuildArguments {
+        CargoBuildArguments::from_iter(&self.argv)
+    }
+
+    /// Check if help is requested in the arguments.
+    pub fn is_help_request(&self) -> bool {
+        self.argv
+            .iter()
+            .any(|arg| matches!(arg.as_str(), "--help" | "-h"))
+    }
+}
+
+#[instrument]
+pub async fn exec(options: Options) -> Result<()> {
+    // If help is requested, passthrough directly to cross to show cross's help
+    if options.is_help_request() {
+        return cross::invoke("build", &options.argv).await;
+    }
+
+    info!("Starting");
+
+    // Parse and validate cargo build arguments.
+    let args = options.parsed_args();
+    debug!(?args, "parsed cross build arguments");
+
+    // Open workspace.
+    let workspace = Workspace::from_argv(&args)
+        .await
+        .context("opening workspace")?;
+    let profile = args.profile().map(Profile::from).unwrap_or(Profile::Debug);
+
+    // Compute artifact plan, which provides expected artifacts. Note that
+    // because we are not actually running build scripts, these "expected
+    // artifacts" do not contain fully unambiguous cache key information.
+    let artifact_plan = workspace
+        .artifact_plan(&profile, &args)
+        .await
+        .context("calculating expected artifacts")?;
+
+    // Initialize cache.
+    let cache = CargoCache::open(options.courier_url, workspace)
+        .await
+        .context("opening cache")?;
+
+    // Restore artifacts.
+    let artifact_count = artifact_plan.artifacts.len() as u64;
+    let restored = if !options.skip_restore {
+        let progress = TransferBar::new(artifact_count, "Restoring cache");
+        cache.restore(&artifact_plan, &progress).await?
+    } else {
+        Default::default()
+    };
+
+    // Run the build.
+    if !options.skip_build {
+        info!("Building target directory");
+
+        // There are two integration points here that we specifically do _not_
+        // use.
+        //
+        // # 1: Using `RUSTC_WRAPPER` to intercept `rustc` invocations
+        //
+        // We could intercept `rustc` invocations using `RUSTC_WRAPPER`. We
+        // prototyped this, and the problem with this approach is that the
+        // wrapper is only invoked when rustc itself is invoked. In particular,
+        // this means that the wrapper is never invoked for crates that have
+        // already been built previously. This means we can't rely on rustc
+        // invocation recording to capture the rustc invocations of _all_
+        // crates. We could structure the recording logs such that we can
+        // quickly access recordings from previous `hurry` invocations (the
+        // original log directory format was
+        // `./target/hurry/rustc/<hurry_invocation_timestamp>/<unit_hash>.json`,
+        // which meant we could quickly look up invocations per unit hash _and_
+        // quickly see if that unit hash was present in previous `hurry` runs),
+        // but this still means that we must at some point clean build every
+        // crate to get its recorded invocation (i.e. users would be forced to
+        // `cargo clean` the very first time they ran `hurry` in a project).
+        //
+        // Instead, we reconstruct the `rustc` invocation from a combination of:
+        // 1. The base static invocation for a package from the build plan.
+        // 2. The parsed build script outputs for a package.
+        //
+        // Theoretically, there is no stable interface that guarantees that this
+        // will fully reconstruct the `rustc` invocation. In practice, we expect
+        // this to work because we stared at the Cargo source code for building
+        // `rustc` flags[^1] for a long time, and hopefully Cargo won't make big
+        // changes any time soon.
+        //
+        // [^1]: https://github.com/rust-lang/cargo/blob/c24e1064277fe51ab72011e2612e556ac56addf7/src/cargo/core/compiler/mod.rs#L360-L375
+        //
+        // # 2: Reading `cargo build --message-format=json`
+        //
+        // `cargo build` has a flag that emits JSON messages about the build,
+        // whose format is stable and documented[^2]. These messages are emitted
+        // on STDOUT, so we can read them while still forwarding interactive
+        // user messages that are emitted on STDERR.
+        //
+        // We don't use this integration point for two reasons:
+        // 1. These messages don't actually give us anything that we don't already get
+        //    from the build plan and build script output.
+        // 2. Enabling this flag actually _changes_ the interactive user messages on
+        //    STDERR. In particular, certain warnings and progress messages are
+        //    different (because they are now emitted on STDOUT as JSON messages e.g.
+        //    compiler errors and warnings), and we now need to add logic to manually
+        //    repaint the progress bar when messages are emitted.
+        //
+        // It's just a whole lot of effort for no incremental value. Instead, we
+        // reconstruct information from these messages using the build plan and
+        // the target directory's build script outputs.
+        //
+        // [^2]: https://doc.rust-lang.org/cargo/reference/external-tools.html#json-messages
+
+        // TODO: Add `RUSTC_WRAPPER` wrapper that records invocations in "debug
+        // mode", so we can assert that our invocation reconstruction works
+        // properly. Maybe that should be added to a test harness?
+
+        // TODO: Maybe we can also use `strace`/`dtrace` to trace child
+        // processes, and use that to determine invocation and OUT_DIR from argv
+        // and environment variables?
+
+        cross::invoke("build", &options.argv)
+            .await
+            .context("build with cross")?;
+
+        // TODO: One thing that _would_ be interesting would be to `epoll` the
+        // target directory while the build is running. Maybe information about
+        // file changes in this directory tree could tell us interesting things
+        // about what changed and needs to be cached.
+    }
+
+    // Cache the built artifacts.
+    if !options.skip_backup {
+        let upload_id = cache.save(artifact_plan, restored).await?;
+        if options.wait_for_upload {
+            let progress = TransferBar::new(artifact_count, "Uploading cache");
+            cache.wait_for_upload(&upload_id, &progress).await?;
+        }
+    }
+
+    Ok(())
+}
