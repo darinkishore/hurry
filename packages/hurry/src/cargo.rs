@@ -26,7 +26,7 @@ mod unit_graph;
 mod workspace;
 
 pub use build_args::{CargoBuildArgument, CargoBuildArguments, ColorWhen, MessageFormat};
-pub use build_plan::BuildPlan;
+pub use build_plan::{BuildPlan, RustcInvocationArgument};
 pub use build_script::{BuildScriptOutput, RootOutput};
 pub use cache::{CacheStats, CargoCache, RestoreState};
 pub use dep_info::{DepInfo, DepInfoLine};

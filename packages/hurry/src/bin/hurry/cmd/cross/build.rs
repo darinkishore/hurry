@@ -105,8 +105,7 @@ pub async fn exec(options: Options) -> Result<()> {
     // Compute artifact plan, which provides expected artifacts. Note that
     // because we are not actually running build scripts, these "expected
     // artifacts" do not contain fully unambiguous cache key information.
-    let artifact_plan = workspace
-        .artifact_plan(&profile, &args)
+    let artifact_plan = hurry::cross::artifact_plan(&workspace, &profile, &args)
         .await
         .context("calculating expected artifacts")?;
 

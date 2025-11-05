@@ -18,6 +18,10 @@ use color_eyre::{
 use tokio::process::Child;
 use tracing::{instrument, trace};
 
+mod workspace;
+
+pub use workspace::artifact_plan;
+
 #[derive(Debug)]
 pub struct Handles {
     pub stdout: Stdio,
