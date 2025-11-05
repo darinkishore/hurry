@@ -27,7 +27,8 @@ enum ConfigState {
     Missing,
     /// Cross.toml existed and already had RUSTC_BOOTSTRAP configured.
     AlreadyConfigured,
-    /// Cross.toml existed but needed RUSTC_BOOTSTRAP added (backed up to this path).
+    /// Cross.toml existed but needed RUSTC_BOOTSTRAP added (backed up to this
+    /// path).
     Modified { backup_path: PathBuf },
 }
 
@@ -146,17 +147,17 @@ impl Drop for CrossConfigGuard {
 
 /// Check if a Cross.toml content already has RUSTC_BOOTSTRAP in passthrough.
 fn has_rustc_bootstrap_passthrough(content: &str) -> bool {
-    // Parse as TOML and check for build.env.passthrough containing "RUSTC_BOOTSTRAP"
+    // Parse as TOML and check for build.env.passthrough containing
+    // "RUSTC_BOOTSTRAP"
     match content.parse::<toml::Table>() {
         Ok(table) => {
-            if let Some(build) = table.get("build").and_then(|v| v.as_table()) {
-                if let Some(env) = build.get("env").and_then(|v| v.as_table()) {
-                    if let Some(passthrough) = env.get("passthrough").and_then(|v| v.as_array()) {
-                        return passthrough
-                            .iter()
-                            .any(|v| v.as_str() == Some("RUSTC_BOOTSTRAP"));
-                    }
-                }
+            if let Some(build) = table.get("build").and_then(|v| v.as_table())
+                && let Some(env) = build.get("env").and_then(|v| v.as_table())
+                && let Some(passthrough) = env.get("passthrough").and_then(|v| v.as_array())
+            {
+                return passthrough
+                    .iter()
+                    .any(|v| v.as_str() == Some("RUSTC_BOOTSTRAP"));
             }
             false
         }

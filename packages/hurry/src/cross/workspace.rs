@@ -101,9 +101,9 @@ async fn build_plan(
 
 /// Compute the artifact plan for a cross build.
 ///
-/// This is the cross-specific version of `Workspace::artifact_plan` that ensures
-/// build plans and rustc metadata are generated in the same environment where
-/// cross will actually perform the compilation.
+/// This is the cross-specific version of `Workspace::artifact_plan` that
+/// ensures build plans and rustc metadata are generated in the same environment
+/// where cross will actually perform the compilation.
 #[instrument(name = "cross::artifact_plan")]
 pub async fn artifact_plan(
     workspace: &crate::cargo::Workspace,
@@ -192,7 +192,8 @@ pub async fn artifact_plan(
                     // First, we need to figure out the build script being
                     // executed. We can do this using the program file being
                     // executed. Convert the program path from container to host.
-                    let host_program = convert_container_path_to_host(&invocation.program, workspace);
+                    let host_program =
+                        convert_container_path_to_host(&invocation.program, workspace);
                     let build_script_index = *build_script_program_file_to_index
                         .get(&host_program)
                         .ok_or_eyre("build script should be compiled before execution")?;
@@ -306,7 +307,8 @@ pub async fn artifact_plan(
                         .ok_or_eyre(
                             "build script index should have recorded compilation directory",
                         )?;
-                    let build_script_compiled_dir = AbsDirPath::try_from(build_script_compiled_dir)?;
+                    let build_script_compiled_dir =
+                        AbsDirPath::try_from(build_script_compiled_dir)?;
                     let build_script_compilation_unit_hash = {
                         let filename = &build_script_compiled_dir
                             .file_name()
