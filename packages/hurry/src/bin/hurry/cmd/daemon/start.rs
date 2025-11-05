@@ -5,7 +5,7 @@ use axum::{
     extract::{FromRef, Request, State},
     middleware::{self, Next},
     response::Response,
-    routing::post,
+    routing::{get, post},
 };
 use clap::Args;
 use color_eyre::{
@@ -152,6 +152,7 @@ pub async fn exec(
             "/api/v0/cargo",
             cargo_router().with_state(state.cargo.clone()),
         )
+        .route("/api/v0/health", get(health))
         .route("/api/v0/shutdown", post(shutdown))
         .with_state(state.clone())
         .layer(middleware::from_fn_with_state(
@@ -252,6 +253,11 @@ struct ServerState {
     cargo: CargoDaemonState,
     shutdown_tx: watch::Sender<bool>,
     idle: IdleState,
+}
+
+#[instrument]
+async fn health() -> Json<serde_json::Value> {
+    Json(serde_json::json!({ "ok": true }))
 }
 
 #[instrument]

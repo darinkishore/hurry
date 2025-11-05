@@ -12,7 +12,7 @@ use crate::{
 use atomic_time::AtomicInstant;
 use color_eyre::{
     Result,
-    eyre::{Context as _, OptionExt as _, bail},
+    eyre::{Context as _, OptionExt as _},
 };
 use derive_more::Debug;
 use serde::{Deserialize, Serialize};
@@ -20,8 +20,6 @@ use std::{
     sync::{Arc, atomic::Ordering},
     time::{Duration, Instant},
 };
-use sysinfo::{Pid, ProcessRefreshKind, RefreshKind, System};
-use tap::Pipe as _;
 use tracing::{debug, instrument, warn};
 
 #[derive(Debug, Clone, Eq, PartialEq, Hash, Serialize, Deserialize)]
@@ -49,27 +47,24 @@ impl DaemonPaths {
     }
 
     pub async fn daemon_running(&self) -> Result<Option<DaemonContext>> {
-        if self.pid_file_path.exists().await {
-            let pid = fs::must_read_buffered_utf8(&self.pid_file_path).await?;
-            match pid.trim().parse::<u32>() {
-                Ok(pid) => {
-                    let system = System::new_with_specifics(
-                        RefreshKind::nothing().with_processes(ProcessRefreshKind::nothing()),
-                    );
-                    let process = system.process(Pid::from_u32(pid));
-                    match process {
-                        Some(_) => self.read_context().await?,
-                        None => None,
-                    }
-                }
-                Err(err) => {
-                    bail!("could not parse pid-file: {err}")
-                }
+        let Some(context) = self.read_context().await? else {
+            return Ok(None);
+        };
+
+        let client = reqwest::Client::new();
+        let url = format!("http://{}/api/v0/health", context.url);
+
+        match client.get(&url).send().await {
+            Ok(response) if response.status().is_success() => Ok(Some(context)),
+            Ok(_) => {
+                debug!("daemon health check returned non-success status");
+                Ok(None)
             }
-        } else {
-            None
+            Err(err) => {
+                debug!(?err, "daemon health check failed");
+                Ok(None)
+            }
         }
-        .pipe(Ok)
     }
 
     pub async fn read_context(&self) -> Result<Option<DaemonContext>> {
