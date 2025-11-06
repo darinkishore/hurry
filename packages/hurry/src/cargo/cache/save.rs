@@ -16,8 +16,8 @@ use crate::{
         RootOutput, Workspace,
     },
     cas::CourierCas,
-    fs,
-    path::{AbsFilePath, TryJoinWith as _},
+    fs, mk_rel_dir,
+    path::{AbsFilePath, JoinWith, TryJoinWith as _},
 };
 use clients::{
     Courier,
@@ -67,7 +67,7 @@ pub async fn save_artifacts(
             continue;
         }
 
-        let lib_files = collect_library_files(&artifact).await?;
+        let lib_files = library_files(&artifact).await?;
         let build_script_files = collect_build_script_files(ws, &artifact).await?;
         let files_to_save = lib_files.into_iter().chain(build_script_files).collect();
         let (library_unit_files, artifact_files, bulk_entries) =
@@ -142,8 +142,49 @@ async fn rewrite(ws: &Workspace, path: &AbsFilePath, content: &[u8]) -> Result<V
     }
 }
 
+struct LibraryFiles {
+    outputs: Vec<AbsFilePath>,
+    fingerprints: Vec<AbsFilePath>,
+    dep_info: AbsFilePath,
+}
+
+impl LibraryFiles {
+    async fn collect(artifact: &BuiltArtifact) -> Result<Self> {
+        let outputs = artifact.lib_files.clone();
+        let fingerprint_dir = artifact.profile_dir().try_join_dirs(&[
+            String::from(".fingerprint"),
+            format!(
+                "{}-{}",
+                artifact.package_name, artifact.library_crate_compilation_unit_hash
+            ),
+        ])?;
+        let fingerprints = fs::walk_files(&fingerprint_dir)
+            .try_collect::<Vec<_>>()
+            .await?;
+        let deps_dir = artifact.profile_dir().join(mk_rel_dir!("deps"));
+        let dep_info = deps_dir.try_join_file(format!(
+            "{}-{}.d",
+            artifact.package_name, artifact.library_crate_compilation_unit_hash
+        ))?;
+        Ok(Self {
+            outputs,
+            fingerprints,
+            dep_info,
+        })
+    }
+}
+
+struct FingerprintFiles {
+    fingerprint_hash: AbsFilePath,
+    fingerprint_json: AbsFilePath,
+    encoded_dep_info: AbsFilePath,
+    invoked_timestamp: AbsFilePath,
+}
+
+struct BuildScriptOutputFiles {}
+
 /// Collect library files and their fingerprints for an artifact.
-async fn collect_library_files(artifact: &BuiltArtifact) -> Result<Vec<AbsFilePath>> {
+async fn library_files(artifact: &BuiltArtifact) -> Result<Vec<AbsFilePath>> {
     let lib_fingerprint_dir = artifact.profile_dir().try_join_dirs(&[
         String::from(".fingerprint"),
         format!(
@@ -243,6 +284,15 @@ async fn process_files_for_upload(
             continue;
         };
 
+        // TODO: `rewrite` should instead take in all the file paths for a
+        // single artifact (note that `process` is called per-artifact) and
+        // return the rewritten contents. Or maybe we should inline the function
+        // here?
+        //
+        // Or would it be better if it took in fingerprint files, etc.
+        // separately for rewriting? Would that make the logic meaningfully
+        // simpler? Or if it took in the fingerprint directory, so it could do
+        // its own walking and querying?
         let content = rewrite(ws, &path, &content).await?;
         let key = Key::from_buffer(&content);
 

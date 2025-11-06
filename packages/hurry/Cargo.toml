@@ -69,6 +69,8 @@ signal-hook = { workspace = true }
 reqwest.workspace = true
 is_executable = { workspace = true }
 directories = { workspace = true }
+rustc-stable-hash = "0.1.2"
+hex.workspace = true
 
 [dev-dependencies]
 async-walkdir.workspace = true

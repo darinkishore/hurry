@@ -418,13 +418,17 @@ impl<B, T> Serialize for TypedPath<B, T> {
 
 impl<B, T> std::fmt::Debug for TypedPath<B, T> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "TypedPath::<{}, {}>::({:?})",
-            type_name::<B>(),
-            type_name::<T>(),
-            self.inner
-        )
+        if f.alternate() {
+            write!(
+                f,
+                "TypedPath::<{}, {}>::({:?})",
+                type_name::<B>(),
+                type_name::<T>(),
+                self.inner
+            )
+        } else {
+            write!(f, "{}", self.inner.display())
+        }
     }
 }
 

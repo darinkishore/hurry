@@ -16,7 +16,7 @@ use uuid::Uuid;
 use crate::{
     cargo::{
         self, BuildPlan, BuildScriptOutput, CargoBuildArguments, CargoCompileMode, Profile,
-        RustcMetadata, build_plan::RustcInvocationArgument,
+        RustcMetadata, build_plan::RustcArgument,
     },
     mk_rel_file,
     path::{AbsDirPath, AbsFilePath, JoinWith as _, TryJoinWith as _},
@@ -380,6 +380,7 @@ impl Workspace {
                     .into_iter()
                     .map(|f| AbsFilePath::try_from(f).context("parsing build plan output file"))
                     .collect::<Result<Vec<_>>>()?;
+                let crate_name = invocation.args.crate_name().ok_or_eyre("no crate name")?.to_owned();
                 let library_crate_compilation_unit_hash = {
                     let compiled_file = lib_files.first().ok_or_eyre("no compiled files")?;
                     let filename = compiled_file
@@ -481,13 +482,14 @@ impl Workspace {
                     "artifacts to save"
                 );
                 let target = invocation.args.iter().find_map(|arg| match arg {
-                    RustcInvocationArgument::Target(target) => Some(target.clone()),
+                    RustcArgument::Target(target) => Some(target.clone()),
                     _ => None,
                 });
 
                 artifacts.push(ArtifactKey {
                     package_name: invocation.package_name,
                     package_version: invocation.package_version,
+                    crate_name,
                     profile: profile.clone(),
                     lib_files,
                     build_script_files,
@@ -553,6 +555,7 @@ pub struct ArtifactKey {
     // that need to be added (e.g. features).
     pub package_name: String,
     pub package_version: String,
+    pub crate_name: String,
 
     // Artifact folders to save and restore.
     pub lib_files: Vec<AbsFilePath>,
@@ -588,6 +591,7 @@ pub struct BuildScriptDirs {
 pub struct BuiltArtifact {
     pub package_name: String,
     pub package_version: String,
+    pub crate_name: String,
 
     pub lib_files: Vec<AbsFilePath>,
     pub build_script_files: Option<BuildScriptDirs>,
@@ -656,6 +660,7 @@ impl BuiltArtifact {
         Ok(BuiltArtifact {
             package_name: key.package_name,
             package_version: key.package_version,
+            crate_name: key.crate_name,
             lib_files: key.lib_files,
             build_script_files: key.build_script_files,
             library_crate_compilation_unit_hash: key.library_crate_compilation_unit_hash,

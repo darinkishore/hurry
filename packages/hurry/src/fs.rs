@@ -25,8 +25,7 @@
 )]
 
 use std::{
-    collections::HashSet, convert::identity, fmt::Debug as StdDebug, marker::PhantomData,
-    sync::Arc, time::SystemTime,
+    convert::identity, fmt::Debug as StdDebug, marker::PhantomData, sync::Arc, time::SystemTime,
 };
 
 use bon::Builder;
@@ -37,7 +36,7 @@ use color_eyre::{
 use derive_more::{Debug, Display};
 use filetime::FileTime;
 use fslock::LockFile as FsLockFile;
-use futures::{Stream, TryStreamExt, future};
+use futures::{Stream, TryStreamExt};
 use jiff::Timestamp;
 use serde::{Deserialize, Serialize};
 use tap::{Pipe, TapFallible};
@@ -46,10 +45,7 @@ use tracing::{debug, error, instrument, trace};
 
 use clients::courier::v1::Key;
 
-use crate::{
-    ext::then_context,
-    path::{AbsDirPath, AbsFilePath, JoinWith, RelFilePath, RelativeTo},
-};
+use crate::path::{AbsDirPath, AbsFilePath, JoinWith, RelativeTo};
 
 /// The default level of concurrency used in hurry `fs` operations.
 ///
@@ -140,58 +136,6 @@ impl LockFile<Locked> {
         .await
         .context("join task")?
         .tap_ok(|f| trace!(path = ?f.path, "unlocked file"))
-    }
-}
-
-/// File index of a directory.
-#[derive(Clone, Debug)]
-pub struct Index {
-    /// The root directory of the index.
-    pub root: AbsDirPath,
-
-    /// Files are relative to `root`.
-    //
-    // TODO: May want to make this a trie or something.
-    // https://docs.rs/fs-tree/0.2.2/fs_tree/ looked like it might work,
-    // but the API was sketchy so I didn't use it for now.
-    #[debug("{}", files.len())]
-    pub files: HashSet<RelFilePath>,
-}
-
-impl Index {
-    /// Index the provided path recursively.
-    #[instrument(name = "Index::recursive")]
-    pub async fn recursive(root: &AbsDirPath) -> Result<Self> {
-        let root = root.clone();
-        let files = walk_files(&root)
-            .and_then(|entry| future::ready(entry.relative_to(&root)))
-            .try_collect::<HashSet<_>>()
-            .await?;
-
-        Ok(Self { root, files })
-    }
-}
-
-/// An entry for a file that was indexed in [`Index`].
-#[derive(Clone, Eq, PartialEq, Ord, PartialOrd, Hash, Debug)]
-pub struct IndexEntry {
-    /// The hash of the file's contents.
-    pub hash: Key,
-
-    /// The metadata of the file.
-    pub metadata: Metadata,
-}
-
-impl IndexEntry {
-    /// Construct the entry from the provided file on disk.
-    #[instrument(name = "IndexEntry::from_file")]
-    pub async fn from_file(path: &AbsFilePath) -> Result<Self> {
-        let hash = hash_file(path).then_context("hash file").await?;
-        let metadata = Metadata::from_file(path)
-            .then_context("get metadata")
-            .await?
-            .ok_or_eyre(format!("file {path:?} should exist"))?;
-        Ok(Self { hash, metadata })
     }
 }
 

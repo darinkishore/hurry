@@ -7,6 +7,10 @@
 -- sql-schema migration --name {new name here}
 -- ```
 
+CREATE TYPE cargo_object_type AS ENUM (
+  ''
+);
+
 CREATE TABLE cargo_object (
   id BIGSERIAL PRIMARY KEY,
   key TEXT NOT NULL,
