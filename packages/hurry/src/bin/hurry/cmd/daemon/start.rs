@@ -23,8 +23,11 @@ use crate::{TopLevelFlags, log};
 use hurry::{
     daemon::{CargoDaemonState, DaemonContext, DaemonPaths, cargo_router},
     fs,
-    path::TryJoinWith,
+    path::{AbsFilePath, TryJoinWith},
 };
+
+/// Maximum age for daemon log files before cleanup (3 days).
+const LOG_MAX_AGE: Duration = Duration::from_secs(3 * 24 * 60 * 60);
 
 #[derive(Clone, Args, Debug)]
 pub struct Options {
@@ -38,72 +41,72 @@ pub struct Options {
     courier_url: Url,
 }
 
+/// Checks if a filename matches the daemon log pattern: `hurryd.[0-9]+.log`
+fn is_daemon_log_file(filename: &str) -> bool {
+    if !filename.starts_with("hurryd.") || !filename.ends_with(".log") {
+        return false;
+    }
+
+    let middle = &filename["hurryd.".len()..filename.len() - ".log".len()];
+    !middle.is_empty() && middle.chars().all(|c| c.is_ascii_digit())
+}
+
 /// Clean up daemon log files older than the specified age.
 ///
 /// This function runs asynchronously in the background and does not block
 /// daemon startup. It scans the cache directory for log files matching the
-/// pattern `hurryd.*.log` and removes those with modification times older
+/// pattern `hurryd.[0-9]+.log` and removes those with modification times older
 /// than the specified duration.
+///
+/// Returns a tuple of (removed_count, error_count).
 #[instrument]
-async fn cleanup_old_logs(cache_dir: &hurry::path::AbsDirPath, max_age: Duration) {
+async fn cleanup_old_logs(cache_dir: &hurry::path::AbsDirPath, max_age: Duration) -> Result<(i32, i32)> {
     debug!("starting log cleanup task");
 
-    let result: Result<()> = async {
-        let mut read_dir = fs::read_dir(cache_dir).await?;
-        let mut removed_count = 0;
-        let mut error_count = 0;
+    let mut read_dir = fs::read_dir(cache_dir).await?;
+    let mut removed_count = 0;
+    let mut error_count = 0;
 
-        let cutoff_time = SystemTime::now()
-            .checked_sub(max_age)
-            .ok_or_else(|| color_eyre::eyre::eyre!("failed to calculate cutoff time"))?;
+    let cutoff_time = SystemTime::now()
+        .checked_sub(max_age)
+        .ok_or_else(|| color_eyre::eyre::eyre!("failed to calculate cutoff time"))?;
 
-        while let Some(entry) = read_dir.next_entry().await? {
-            let path = entry.path();
+    while let Some(entry) = read_dir.next_entry().await? {
+        let path = entry.path();
 
-            // Check if the file matches the daemon log pattern
-            if let Some(filename) = path.file_name().and_then(|n| n.to_str())
-                && filename.starts_with("hurryd.")
-                && filename.ends_with(".log")
-            {
-                // Check the file's modification time
-                match fs::metadata(&path).await {
-                    Ok(Some(metadata)) => {
-                        if let Ok(modified) = metadata.modified()
-                            && modified < cutoff_time
-                        {
-                            // Try to remove the old log file
-                            match tokio::fs::remove_file(&path).await {
-                                Ok(_) => {
-                                    debug!(?path, "removed old log file");
-                                    removed_count += 1;
-                                }
-                                Err(err) => {
-                                    warn!(?path, ?err, "failed to remove old log file");
-                                    error_count += 1;
-                                }
+        if let Some(filename) = path.file_name().and_then(|n| n.to_str())
+            && is_daemon_log_file(filename)
+        {
+            match fs::metadata(&path).await {
+                Ok(Some(metadata)) => {
+                    if let Ok(modified) = metadata.modified()
+                        && modified < cutoff_time
+                    {
+                        let abs_path = AbsFilePath::try_from(path.clone())?;
+                        match fs::remove_file(&abs_path).await {
+                            Ok(_) => {
+                                debug!(?path, "removed old log file");
+                                removed_count += 1;
+                            }
+                            Err(err) => {
+                                warn!(?path, ?err, "failed to remove old log file");
+                                error_count += 1;
                             }
                         }
                     }
-                    Ok(None) => {
-                        debug!(?path, "log file does not exist (race condition)");
-                    }
-                    Err(err) => {
-                        warn!(?path, ?err, "failed to get metadata for log file");
-                        error_count += 1;
-                    }
+                }
+                Ok(None) => {
+                    debug!(?path, "log file does not exist (race condition)");
+                }
+                Err(err) => {
+                    warn!(?path, ?err, "failed to get metadata for log file");
+                    error_count += 1;
                 }
             }
         }
-
-        info!(removed_count, error_count, "log cleanup completed");
-
-        Ok(())
     }
-    .await;
 
-    if let Err(err) = result {
-        warn!(?err, "log cleanup task failed");
-    }
+    Ok((removed_count, error_count))
 }
 
 #[instrument(skip(cli_logger))]
@@ -147,7 +150,14 @@ pub async fn exec(
     {
         let cache_dir = cache_dir.clone();
         tokio::spawn(async move {
-            cleanup_old_logs(&cache_dir, Duration::from_secs(3 * 24 * 60 * 60)).await;
+            match cleanup_old_logs(&cache_dir, LOG_MAX_AGE).await {
+                Ok((removed_count, error_count)) => {
+                    info!(removed_count, error_count, "log cleanup completed");
+                }
+                Err(err) => {
+                    warn!(?err, "log cleanup task failed");
+                }
+            }
         });
     }
 
