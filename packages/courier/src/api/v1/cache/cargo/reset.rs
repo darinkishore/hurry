@@ -1,13 +1,13 @@
 use aerosol::axum::Dep;
 use axum::http::StatusCode;
-use color_eyre::Result;
 use tracing::{error, info, instrument};
 
-use crate::{db::Postgres, storage::Disk};
+use crate::{auth::AuthenticatedToken, db::Postgres};
 
-#[instrument(skip_all)]
-pub async fn handle(Dep(db): Dep<Postgres>, Dep(storage): Dep<Disk>) -> StatusCode {
-    match reset_all(&db, &storage).await {
+#[instrument(skip(auth))]
+pub async fn handle(auth: AuthenticatedToken, Dep(db): Dep<Postgres>) -> StatusCode {
+    // Delete the authenticated org's cache data
+    match db.cargo_cache_reset(&auth).await {
         Ok(()) => {
             info!("cache.reset.success");
             StatusCode::NO_CONTENT
@@ -19,25 +19,6 @@ pub async fn handle(Dep(db): Dep<Postgres>, Dep(storage): Dep<Disk>) -> StatusCo
     }
 }
 
-/// Reset all cache data: delete all database records and CAS blobs.
-#[instrument]
-async fn reset_all(db: &Postgres, storage: &Disk) -> Result<()> {
-    db.cargo_cache_reset().await?;
-
-    tokio::fs::remove_dir_all(storage.root())
-        .await
-        .or_else(|err| {
-            if err.kind() == std::io::ErrorKind::NotFound {
-                Ok(())
-            } else {
-                Err(err)
-            }
-        })?;
-    tokio::fs::create_dir_all(storage.root()).await?;
-
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use axum::http::StatusCode;
@@ -46,9 +27,12 @@ mod tests {
     use serde_json::json;
     use sqlx::PgPool;
 
+    use crate::api::test_helpers::test_server;
+
     #[sqlx::test(migrator = "crate::db::Postgres::MIGRATOR")]
+    #[test_log::test]
     async fn resets_cache(pool: PgPool) -> Result<()> {
-        let (server, _tmp) = crate::api::test_server(pool.clone())
+        let (server, auth, _tmp) = test_server(pool.clone())
             .await
             .context("create test server")?;
 
@@ -69,7 +53,11 @@ mod tests {
             }]
         });
 
-        let response = server.post("/api/v1/cache/cargo/save").json(&request).await;
+        let response = server
+            .post("/api/v1/cache/cargo/save")
+            .authorization_bearer(auth.token_alice().expose())
+            .json(&request)
+            .await;
         response.assert_status(StatusCode::CREATED);
 
         // Verify data exists
@@ -83,10 +71,13 @@ mod tests {
         pretty_assert_eq!(count, 1);
 
         // Reset cache
-        let response = server.post("/api/v1/cache/cargo/reset").await;
+        let response = server
+            .post("/api/v1/cache/cargo/reset")
+            .authorization_bearer(auth.token_alice().expose())
+            .await;
         response.assert_status(StatusCode::NO_CONTENT);
 
-        // Verify all data is gone
+        // Verify cache metadata is gone
         let count = sqlx::query!("SELECT COUNT(*) as count FROM cargo_package")
             .fetch_one(&db.pool)
             .await
@@ -95,13 +86,16 @@ mod tests {
             .unwrap_or(0);
         pretty_assert_eq!(count, 0);
 
-        let count = sqlx::query!("SELECT COUNT(*) as count FROM cargo_object")
+        let count = sqlx::query!("SELECT COUNT(*) as count FROM cargo_library_unit_build")
             .fetch_one(&db.pool)
             .await
-            .context("query objects after reset")?
+            .context("query builds after reset")?
             .count
             .unwrap_or(0);
         pretty_assert_eq!(count, 0);
+
+        // Note: cargo_object (CAS layer) is not deleted as it's shared across orgs
+        // Only the org's cache metadata is removed
 
         Ok(())
     }

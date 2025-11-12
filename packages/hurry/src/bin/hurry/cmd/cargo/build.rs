@@ -9,13 +9,14 @@ use std::time::Duration;
 use clap::Args;
 use color_eyre::{
     Result, Section as _, SectionExt as _,
-    eyre::{Context, OptionExt as _, bail},
+    eyre::{Context, OptionExt as _, bail, eyre},
 };
 use derive_more::Debug;
 use tracing::{debug, info, instrument, trace, warn};
 use url::Url;
 use uuid::Uuid;
 
+use clients::Token;
 use hurry::{
     cargo::{self, CargoBuildArguments, CargoCache, Profile, Workspace},
     ci::is_ci,
@@ -44,6 +45,13 @@ pub struct Options {
     )]
     #[debug("{courier_url}")]
     courier_url: Url,
+
+    /// Authentication token for the Courier instance.
+    // Note: this field is not _actually_ optional for `hurry` to operate; we're just telling clap
+    // that it is so that if the user runs with the `-h` or `--help` arguments we can not require
+    // the token in that case.
+    #[arg(long = "hurry-courier-token", env = "HURRY_COURIER_TOKEN")]
+    courier_token: Option<Token>,
 
     /// Skip backing up the cache.
     #[arg(long = "hurry-skip-backup", default_value_t = false)]
@@ -116,6 +124,14 @@ pub async fn exec(options: Options) -> Result<()> {
         return cargo::invoke("build", &options.argv).await;
     }
 
+    // We make the courier token required here; if we make it required in the actual
+    // clap state then we aren't able to support e.g. `cargo build -h` passthrough.
+    let Some(token) = &options.courier_token else {
+        return Err(eyre!("Courier authentication token is required"))
+            .suggestion("Set the `HURRY_COURIER_TOKEN` environment variable")
+            .suggestion("Provide it with the `--hurry-courier-token` argument");
+    };
+
     info!("Starting");
 
     // Parse and validate cargo build arguments.
@@ -137,7 +153,7 @@ pub async fn exec(options: Options) -> Result<()> {
         .context("calculating expected artifacts")?;
 
     // Initialize cache.
-    let cache = CargoCache::open(options.courier_url, workspace)
+    let cache = CargoCache::open(options.courier_url, token.clone(), workspace)
         .await
         .context("opening cache")?;
 
