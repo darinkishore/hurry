@@ -13,7 +13,7 @@ use tracing::{instrument, trace};
 use crate::{
     cargo::{
         path2::QualifiedPath,
-        workspace2::{UnitPlan, Workspace},
+        workspace2::{UnitPlanInfo, Workspace},
     },
     ext::{then_context, then_with_context},
     fs::{self, DEFAULT_CONCURRENCY},
@@ -63,7 +63,7 @@ impl DepInfo {
     /// parses each line for the `output:` format, and filters for relevant
     /// file extensions. All returned paths are relative to the profile root.
     #[instrument(name = "DepInfo::from_file")]
-    pub async fn from_file(ws: &Workspace, unit: &UnitPlan, dotd: &AbsFilePath) -> Result<Self> {
+    pub async fn from_file(ws: &Workspace, unit: &UnitPlanInfo, dotd: &AbsFilePath) -> Result<Self> {
         let content = fs::read_buffered_utf8(dotd)
             .await
             .context("read file")?
@@ -85,7 +85,7 @@ impl DepInfo {
 
     /// Reconstruct the "dep-info" file in the context of the profile directory.
     #[instrument(name = "DepInfo::reconstruct")]
-    pub fn reconstruct(&self, ws: &Workspace, unit: &UnitPlan) -> String {
+    pub fn reconstruct(&self, ws: &Workspace, unit: &UnitPlanInfo) -> String {
         self.0
             .iter()
             .map(|line| line.reconstruct(ws, unit))
@@ -147,7 +147,7 @@ impl DepInfoLine {
     // [^3]: https://doc.rust-lang.org/nightly/nightly-rustc/cargo/core/compiler/fingerprint/dep_info/struct.RustcDepInfo.html
     // [^4]: https://doc.rust-lang.org/nightly/nightly-rustc/cargo/core/compiler/fingerprint/dep_info/fn.parse_rustc_dep_info.html
     #[instrument(name = "DepInfoLine::parse")]
-    pub async fn parse(ws: &Workspace, unit: &UnitPlan, line: &str) -> Result<Self> {
+    pub async fn parse(ws: &Workspace, unit: &UnitPlanInfo, line: &str) -> Result<Self> {
         Ok(if line.is_empty() {
             Self::Space
         } else if let Some(comment) = line.strip_prefix('#') {
@@ -183,7 +183,7 @@ impl DepInfoLine {
     }
 
     #[instrument(name = "DepInfoLine::reconstruct")]
-    pub fn reconstruct(&self, ws: &Workspace, unit: &UnitPlan) -> String {
+    pub fn reconstruct(&self, ws: &Workspace, unit: &UnitPlanInfo) -> String {
         match self {
             Self::Build(output, inputs) => {
                 let output = output.reconstruct_string(ws, unit);

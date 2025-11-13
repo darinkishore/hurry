@@ -13,7 +13,7 @@ use tap::TapFallible;
 use tracing::{instrument, trace};
 
 use crate::{
-    cargo::{path2::QualifiedPath, workspace2::{UnitPlan, Workspace}},
+    cargo::{path2::QualifiedPath, workspace2::{UnitPlanInfo, Workspace}},
     fs,
     path::{AbsDirPath, AbsFilePath},
 };
@@ -42,7 +42,7 @@ pub struct BuildScriptOutput(Vec<BuildScriptOutputLine>);
 impl BuildScriptOutput {
     /// Parse a build script output file.
     #[instrument(name = "BuildScriptOutput::from_file")]
-    pub async fn from_file(ws: &Workspace, unit: &UnitPlan, file: &AbsFilePath) -> Result<Self> {
+    pub async fn from_file(ws: &Workspace, unit: &UnitPlanInfo, file: &AbsFilePath) -> Result<Self> {
         let content = fs::read_buffered_utf8(file)
             .await
             .context("read file")?
@@ -58,7 +58,7 @@ impl BuildScriptOutput {
 
     /// Reconstruct the file in the context of the profile directory.
     #[instrument(name = "BuildScriptOutput::reconstruct")]
-    pub fn reconstruct(&self, ws: &Workspace, unit: &UnitPlan) -> String {
+    pub fn reconstruct(&self, ws: &Workspace, unit: &UnitPlanInfo) -> String {
         self.0.iter().map(|line| line.reconstruct(ws, unit)).join("\n")
     }
 }
@@ -207,7 +207,7 @@ impl BuildScriptOutputLine {
 
     /// Parse a line of the build script file.
     #[instrument(name = "BuildScriptOutputLine::parse")]
-    pub async fn parse(ws: &Workspace, unit: &UnitPlan, line: &str) -> Self {
+    pub async fn parse(ws: &Workspace, unit: &UnitPlanInfo, line: &str) -> Self {
         match Self::parse_inner(ws, unit, line).await {
             Ok(parsed) => parsed,
             Err(err) => {
@@ -218,7 +218,7 @@ impl BuildScriptOutputLine {
     }
 
     /// Inner fallible parser for cargo directives.
-    async fn parse_inner(ws: &Workspace, unit: &UnitPlan, line: &str) -> Result<Self> {
+    async fn parse_inner(ws: &Workspace, unit: &UnitPlanInfo, line: &str) -> Result<Self> {
         let (style, line) = BuildScriptOutputLineStyle::parse_line(line)?;
         let Some((key, value)) = line.split_once('=') else {
             return Err(eyre!("directive does not contain '='"));
@@ -294,7 +294,7 @@ impl BuildScriptOutputLine {
 
     /// Reconstruct the line in the current context.
     #[instrument(name = "BuildScriptOutputLine::reconstruct")]
-    pub fn reconstruct(&self, ws: &Workspace, unit: &UnitPlan) -> String {
+    pub fn reconstruct(&self, ws: &Workspace, unit: &UnitPlanInfo) -> String {
         match self {
             Self::RerunIfChanged(style, path) => {
                 format!(

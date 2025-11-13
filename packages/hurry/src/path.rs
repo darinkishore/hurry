@@ -612,21 +612,23 @@ duplicate! {
 ///
 /// For more details on how `Validator` works, view the docs for [`TypedPath`].
 pub trait TryJoinWith {
+    type OutputBase;
+
     /// Join `dir` to `self` as a directory.
     ///
     /// If joining multiple items, consider [`TryJoinWith::try_join_dirs`]
     /// or [`TryJoinWith::try_join_combined`] as these are more efficient.
-    fn try_join_dir(&self, dir: impl AsRef<str>) -> Result<AbsDirPath>;
+    fn try_join_dir(&self, dir: impl AsRef<str>) -> Result<TypedPath<Self::OutputBase, Dir>>;
 
     /// Join `file` to `self` as a file.
     ///
     /// If joining multiple items, consider [`TryJoinWith::try_join_dirs`]
     /// or [`TryJoinWith::try_join_combined`] as these are more efficient.
-    fn try_join_file(&self, file: impl AsRef<str>) -> Result<AbsFilePath>;
+    fn try_join_file(&self, file: impl AsRef<str>) -> Result<TypedPath<Self::OutputBase, File>>;
 
     /// Join multiple directories to `self`.
     /// The overall path is checked at the end instead of piece by piece.
-    fn try_join_dirs(&self, dirs: impl IntoIterator<Item = impl AsRef<str>>) -> Result<AbsDirPath>;
+    fn try_join_dirs(&self, dirs: impl IntoIterator<Item = impl AsRef<str>>) -> Result<TypedPath<Self::OutputBase, Dir>>;
 
     /// Join multiple directories, followed by a file, to `self`.
     /// The overall path is checked at the end instead of piece by piece.
@@ -634,10 +636,12 @@ pub trait TryJoinWith {
         &self,
         dirs: impl IntoIterator<Item = impl AsRef<str>>,
         file: impl AsRef<str>,
-    ) -> Result<AbsFilePath>;
+    ) -> Result<TypedPath<Self::OutputBase, File>>;
 }
 
 impl TryJoinWith for TypedPath<Abs, Dir> {
+    type OutputBase = Abs;
+
     fn try_join_dir(&self, other: impl AsRef<str>) -> Result<AbsDirPath> {
         self.inner.join(other.as_ref()).pipe(AbsDirPath::try_from)
     }
@@ -667,6 +671,38 @@ impl TryJoinWith for TypedPath<Abs, Dir> {
     }
 }
 
+impl TryJoinWith for TypedPath<Rel, Dir> {
+    type OutputBase = Rel;
+
+    fn try_join_dir(&self, other: impl AsRef<str>) -> Result<RelDirPath> {
+        self.inner.join(other.as_ref()).pipe(RelDirPath::try_from)
+    }
+
+    fn try_join_file(&self, other: impl AsRef<str>) -> Result<RelFilePath> {
+        self.inner.join(other.as_ref()).pipe(RelFilePath::try_from)
+    }
+
+    fn try_join_dirs(&self, dirs: impl IntoIterator<Item = impl AsRef<str>>) -> Result<RelDirPath> {
+        let mut inner = self.inner.clone();
+        for other in dirs {
+            inner = inner.join(other.as_ref());
+        }
+        RelDirPath::try_from(inner)
+    }
+
+    fn try_join_combined(
+        &self,
+        dirs: impl IntoIterator<Item = impl AsRef<str>>,
+        file: impl AsRef<str>,
+    ) -> Result<RelFilePath> {
+        let mut inner = self.inner.clone();
+        for other in dirs {
+            inner = inner.join(other.as_ref());
+        }
+        inner.join(file.as_ref()).pipe(RelFilePath::try_from)
+    }
+}
+
 /// Infallibly joins known valid paths together.
 pub trait JoinWith<Other> {
     type Output;
@@ -687,6 +723,25 @@ pub trait JoinWith<Other> {
     [ &TypedPath<Rel, SomeType> ] [ TypedPath<Abs, SomeType> ];
 )]
 impl JoinWith<ty_other> for TypedPath<Abs, Dir> {
+    type Output = ty_output;
+
+    fn join(&self, other: ty_other) -> Self::Output {
+        self.as_std_path()
+            .join(other.as_std_path())
+            .pipe(TypedPath::new_unchecked)
+    }
+}
+
+#[duplicate_item(
+    ty_other ty_output;
+    [ TypedPath<Rel, Dir> ] [ TypedPath<Rel, Dir> ];
+    [ &TypedPath<Rel, Dir> ] [ TypedPath<Rel, Dir> ];
+    [ TypedPath<Rel, File> ] [ TypedPath<Rel, File> ];
+    [ &TypedPath<Rel, File> ] [ TypedPath<Rel, File> ];
+    [ TypedPath<Rel, SomeType> ] [ TypedPath<Rel, SomeType> ];
+    [ &TypedPath<Rel, SomeType> ] [ TypedPath<Rel, SomeType> ];
+)]
+impl JoinWith<ty_other> for TypedPath<Rel, Dir> {
     type Output = ty_output;
 
     fn join(&self, other: ty_other) -> Self::Output {

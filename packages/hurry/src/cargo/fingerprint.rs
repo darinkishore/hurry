@@ -113,6 +113,10 @@ impl Fingerprint {
         *self.memoized_hash.lock().unwrap() = Some(ret);
         ret
     }
+
+    pub fn fingerprint_hash(&self) -> String {
+        hex::encode(self.hash_u64().to_le_bytes())
+    }
 }
 
 impl Hash for Fingerprint {

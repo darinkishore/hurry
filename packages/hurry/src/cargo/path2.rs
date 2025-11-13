@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 use tracing::instrument;
 
 use crate::{
-    cargo::workspace2::{UnitPlan, Workspace},
+    cargo::workspace2::{UnitPlanInfo, Workspace},
     fs,
     path::{
         AbsDirPath, AbsFilePath, AbsSomePath, GenericPath, JoinWith as _, RelFilePath, RelSomePath, RelativeTo as _
@@ -68,13 +68,13 @@ pub enum QualifiedPath {
 // relative to.
 impl QualifiedPath {
     #[instrument(name = "QualifiedPath::parse_string")]
-    pub async fn parse_string(ws: &Workspace, unit: &UnitPlan, path: &str) -> Result<Self> {
+    pub async fn parse_string(ws: &Workspace, unit: &UnitPlanInfo, path: &str) -> Result<Self> {
         let path = Path::new(path);
         Self::parse(ws, unit, path).await
     }
 
     #[instrument(name = "QualifiedPath::parse")]
-    pub async fn parse(ws: &Workspace, unit: &UnitPlan, path: &Path) -> Result<Self> {
+    pub async fn parse(ws: &Workspace, unit: &UnitPlanInfo, path: &Path) -> Result<Self> {
         // TODO: It would be nice to get this to work with `TypedPath`, but it's
         // pretty annoying converting `GenericPath` into `TypedPath` variants.
         let profile_dir = match &unit.target_arch {
@@ -103,12 +103,12 @@ impl QualifiedPath {
     }
 
     #[instrument(name = "QualifiedPath::reconstruct_string")]
-    pub fn reconstruct_string(&self, ws: &Workspace, unit: &UnitPlan) -> String {
+    pub fn reconstruct_string(&self, ws: &Workspace, unit: &UnitPlanInfo) -> String {
         Self::reconstruct(self, ws, unit).to_string()
     }
 
     #[instrument(name = "QualifiedPath::reconstruct")]
-    pub fn reconstruct(&self, ws: &Workspace, unit: &UnitPlan) -> GenericPath {
+    pub fn reconstruct(&self, ws: &Workspace, unit: &UnitPlanInfo) -> GenericPath {
         let profile_dir = match &unit.target_arch {
             Some(_) => ws.target_profile_dir(),
             None => ws.host_profile_dir(),

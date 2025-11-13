@@ -24,7 +24,10 @@ use crate::{
         Profile, RustcMetadata, build_plan::RustcArgument,
     },
     fs, mk_rel_dir, mk_rel_file,
-    path::{AbsDirPath, AbsFilePath, JoinWith as _, TryJoinWith as _},
+    path::{
+        AbsDirPath, AbsFilePath, JoinWith as _, RelDirPath, RelFilePath, RelativeTo,
+        TryJoinWith as _,
+    },
 };
 
 /// The Cargo workspace of a build.
@@ -267,6 +270,10 @@ impl Workspace {
             })
     }
 
+    /// Return the unit plan for this workspace.
+    ///
+    /// Units are guaranteed to be returned in linearized dependency order (i.e.
+    /// no unit will ever have a dependency on a unit that comes after it).
     #[instrument(name = "Workspace::unit_plan")]
     pub async fn unit_plan(
         &self,
@@ -322,6 +329,21 @@ impl Workspace {
             let unit = if invocation.target_kind == [TargetKind::CustomBuild] {
                 match invocation.compile_mode {
                     CargoCompileMode::Build => {
+                        // Build scripts always compile to a single program and
+                        // a renamed hard link to the same program.
+                        //
+                        // This is parsed from the `outputs` and `links` paths
+                        // in the unit's build plan invocation.
+                        //
+                        // These file paths must have their mtimes modified to
+                        // be later than the fingerprint's invoked timestamp for
+                        // the unit to be marked fresh.
+                        //
+                        // In the actual unit struct, we reconstruct these
+                        // values from the build script main entry point module
+                        // name. But here, we parse the values out of the build
+                        // plan and check that our reconstructions are accurate
+                        // as a sanity check.
                         let compiled_program = invocation
                             .outputs
                             .into_iter()
@@ -364,20 +386,33 @@ impl Workspace {
                             .ok_or_eyre("build script compilation should have a crate name")?
                             .to_string();
                         let src_path = invocation.args.src_path().pipe(AbsFilePath::try_from)?;
-                        UnitPlan {
-                            unit_hash,
-                            package_name,
-                            crate_name,
-                            target_arch,
-                            deps,
-                            mode: UnitPlanMode::BuildScriptCompilation(
-                                BuildScriptCompilationUnitPlan {
-                                    src_path,
-                                    program: compiled_program,
-                                    linked_program,
-                                },
-                            ),
+                        // Sanity check that constructed values match parsed
+                        // values.
+                        let profile_dir = match &target_arch {
+                            Some(_) => self.target_profile_dir(),
+                            None => self.host_profile_dir(),
+                        };
+                        let bsc_unit = BuildScriptCompilationUnitPlan {
+                            info: UnitPlanInfo {
+                                unit_hash,
+                                package_name,
+                                crate_name,
+                                target_arch,
+                                deps,
+                            },
+                            src_path,
+                        };
+                        if bsc_unit.program_file()? != compiled_program.relative_to(&profile_dir)? {
+                            bail!("build script program filepath reconstruction mismatch");
                         }
+                        if bsc_unit.linked_program_file()?
+                            != linked_program.relative_to(&profile_dir)?
+                        {
+                            bail!(
+                                "build script program hard link filepath reconstruction mismatch"
+                            );
+                        }
+                        UnitPlan::BuildScriptCompilation(bsc_unit)
                     }
                     CargoCompileMode::RunCustomBuild => {
                         let program = invocation.program.pipe(AbsFilePath::try_from)?;
@@ -406,16 +441,31 @@ impl Workspace {
                             //
                             // [^1]: https://github.com/attunehq/cargo/blob/7a93b36f1ae2f524d93efd16cd42864675f3e15b/src/cargo/core/manifest.rs#L961
                             .replace("-", "_");
-                        UnitPlan {
-                            unit_hash,
-                            package_name,
-                            crate_name,
-                            target_arch,
-                            deps,
-                            mode: UnitPlanMode::BuildScriptExecution(
-                                BuildScriptExecutionUnitPlan { program, out_dir },
-                            ),
+                        let build_script_program_name = program
+                            .file_name_str_lossy()
+                            .ok_or_eyre("build script program should have name")?
+                            .to_string();
+                        // Sanity check that constructed values match parsed
+                        // values.
+                        let profile_dir = match &target_arch {
+                            Some(_) => self.target_profile_dir(),
+                            None => self.host_profile_dir(),
+                        };
+                        let bse_unit = BuildScriptExecutionUnitPlan {
+                            info: UnitPlanInfo {
+                                unit_hash,
+                                package_name,
+                                crate_name,
+                                target_arch,
+                                deps,
+                            },
+                            build_script_program_name,
+                        };
+                        if bse_unit.out_dir()? != out_dir.relative_to(&profile_dir)? {
+                            bail!("build script out_dir reconstruction mismatch");
                         }
+
+                        UnitPlan::BuildScriptExecution(bse_unit)
                     }
                     _ => bail!(
                         "unknown compile mode for build script: {:?}",
@@ -476,14 +526,17 @@ impl Workspace {
                         .to_string()
                 };
 
-                UnitPlan {
-                    unit_hash,
-                    package_name,
-                    crate_name,
-                    target_arch,
-                    deps,
-                    mode: UnitPlanMode::LibraryCrate(LibraryCrateUnitPlan { src_path, outputs }),
-                }
+                UnitPlan::LibraryCrate(LibraryCrateUnitPlan {
+                    info: UnitPlanInfo {
+                        unit_hash,
+                        package_name,
+                        crate_name,
+                        target_arch,
+                        deps,
+                    },
+                    src_path,
+                    outputs,
+                })
             } else {
                 bail!("unsupported target kind: {:?}", invocation.target_kind);
             };
@@ -494,8 +547,9 @@ impl Workspace {
     }
 }
 
+/// Fields which are shared between all unit plan types.
 #[derive(Debug, Clone, Eq, PartialEq, Hash, Serialize, Deserialize)]
-pub struct UnitPlan {
+pub struct UnitPlanInfo {
     /// The directory hash of the unit, which is used to construct the unit's
     /// file directories.
     ///
@@ -553,35 +607,89 @@ pub struct UnitPlan {
     ///
     /// [^1]: https://doc.rust-lang.org/cargo/reference/build-scripts.html#the-links-manifest-key
     pub deps: Vec<u32>,
-
-    /// Mode-specific information about this unit.
-    ///
-    /// This is similar to an amalgamation of TargetKind[^1] and
-    /// CompileMode[^2].
-    ///
-    /// Note that we separate compiling library crates from build scripts
-    /// because they store artifacts at different paths in the build directory.
-    ///
-    /// [^1]: https://github.com/attunehq/cargo/blob/7a93b36f1ae2f524d93efd16cd42864675f3e15b/src/cargo/core/manifest.rs#L215
-    /// [^2]: https://github.com/attunehq/cargo/blob/7a93b36f1ae2f524d93efd16cd42864675f3e15b/src/cargo/core/compiler/build_config.rs#L171
-    pub mode: UnitPlanMode,
 }
 
+impl UnitPlanInfo {
+    pub fn deps_dir(&self) -> Result<RelDirPath> {
+        Ok(mk_rel_dir!("deps"))
+    }
+
+    pub fn fingerprint_dir(&self) -> Result<RelDirPath> {
+        mk_rel_dir!(".fingerprint")
+            .try_join_dir(format!("{}-{}", self.package_name, self.unit_hash))
+    }
+
+    pub fn build_dir(&self) -> Result<RelDirPath> {
+        mk_rel_dir!("build").try_join_dir(format!("{}-{}", self.package_name, self.unit_hash))
+    }
+}
+
+/// Mode-specific information about this unit.
+///
+/// This is similar to an amalgamation of TargetKind[^1] and
+/// CompileMode[^2].
+///
+/// Note that we separate compiling library crates from build scripts (even
+/// though they are the same CompileMode) because they store artifacts at
+/// different paths in the build directory.
+///
+/// [^1]: https://github.com/attunehq/cargo/blob/7a93b36f1ae2f524d93efd16cd42864675f3e15b/src/cargo/core/manifest.rs#L215
+/// [^2]: https://github.com/attunehq/cargo/blob/7a93b36f1ae2f524d93efd16cd42864675f3e15b/src/cargo/core/compiler/build_config.rs#L171
 #[derive(Debug, Clone, Eq, PartialEq, Hash, Serialize, Deserialize)]
-pub enum UnitPlanMode {
+pub enum UnitPlan {
     LibraryCrate(LibraryCrateUnitPlan),
     BuildScriptCompilation(BuildScriptCompilationUnitPlan),
     BuildScriptExecution(BuildScriptExecutionUnitPlan),
 }
 
+impl UnitPlan {
+    pub fn info(&self) -> &UnitPlanInfo {
+        match self {
+            UnitPlan::LibraryCrate(plan) => &plan.info,
+            UnitPlan::BuildScriptCompilation(plan) => &plan.info,
+            UnitPlan::BuildScriptExecution(plan) => &plan.info,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Eq, PartialEq, Hash, Serialize, Deserialize)]
 pub struct LibraryCrateUnitPlan {
+    pub info: UnitPlanInfo,
     pub src_path: AbsFilePath,
     pub outputs: Vec<AbsFilePath>,
 }
 
+impl LibraryCrateUnitPlan {
+    pub fn dep_info_file(&self) -> Result<RelFilePath> {
+        self.info.deps_dir()?.try_join_file(format!(
+            "{}-{}.d",
+            self.info.crate_name, self.info.unit_hash
+        ))
+    }
+
+    pub fn encoded_dep_info_file(&self) -> Result<RelFilePath> {
+        self.info
+            .fingerprint_dir()?
+            .try_join_file(format!("dep-lib-{}", self.info.crate_name))
+    }
+
+    pub fn fingerprint_json_file(&self) -> Result<RelFilePath> {
+        self.info
+            .fingerprint_dir()?
+            .try_join_file(format!("lib-{}.json", self.info.crate_name))
+    }
+
+    pub fn fingerprint_hash_file(&self) -> Result<RelFilePath> {
+        self.info
+            .fingerprint_dir()?
+            .try_join_file(format!("lib-{}", self.info.crate_name))
+    }
+}
+
 #[derive(Debug, Clone, Eq, PartialEq, Hash, Serialize, Deserialize)]
 pub struct BuildScriptCompilationUnitPlan {
+    pub info: UnitPlanInfo,
+
     /// The path to the build script's main entrypoint source file. This is
     /// usually `build.rs` within the package's source code, but can vary if
     /// the package author sets `package.build` in the package's
@@ -595,6 +703,19 @@ pub struct BuildScriptCompilationUnitPlan {
     ///
     /// [^1]: https://doc.rust-lang.org/cargo/reference/manifest.html#the-build-field
     pub src_path: AbsFilePath,
+}
+
+impl BuildScriptCompilationUnitPlan {
+    fn entrypoint_module_name(&self) -> Result<String> {
+        let src_path_filename = self
+            .src_path
+            .file_name_str_lossy()
+            .ok_or_eyre("build script source path has no name")?;
+        Ok(src_path_filename
+            .strip_suffix(".rs")
+            .ok_or_eyre("build script source path has no `.rs` extension")?
+            .to_string())
+    }
 
     /// Build scripts always compile to a single program and a renamed hard
     /// link to the same program.
@@ -604,14 +725,48 @@ pub struct BuildScriptCompilationUnitPlan {
     ///
     /// These file paths must have their mtimes modified to be later than
     /// the fingerprint's invoked timestamp for the unit to be marked fresh.
-    // TODO: We could simplify this struct. You can actually derive both of
-    // these paths from the build script entrypoint module name and the unit
-    // hash, and you can derive the build script entrypoint module name from the
-    // src_path. So really, the only field we _need_ is `src_path`.
-    //
-    // TODO: Add impls on these unit plan structs to construct relevant paths?
-    pub program: AbsFilePath,
-    pub linked_program: AbsFilePath,
+    pub fn program_file(&self) -> Result<RelFilePath> {
+        self.info.build_dir()?.try_join_file(format!(
+            "build_script_{}-{}",
+            self.entrypoint_module_name()?.replace("-", "_"),
+            self.info.unit_hash
+        ))
+    }
+
+    pub fn linked_program_file(&self) -> Result<RelFilePath> {
+        self.info
+            .build_dir()?
+            .try_join_file(format!("build-script-{}", self.entrypoint_module_name()?))
+    }
+
+    pub fn dep_info_file(&self) -> Result<RelFilePath> {
+        self.info.build_dir()?.try_join_file(format!(
+            "build_script_{}-{}.d",
+            self.entrypoint_module_name()?.replace("-", "_"),
+            self.info.unit_hash
+        ))
+    }
+
+    pub fn encoded_dep_info_file(&self) -> Result<RelFilePath> {
+        self.info.fingerprint_dir()?.try_join_file(format!(
+            "dep-build-script-build-script-{}",
+            self.entrypoint_module_name()?
+        ))
+    }
+
+    pub fn fingerprint_json_file(&self) -> Result<RelFilePath> {
+        self.info.fingerprint_dir()?.try_join_file(format!(
+            "build-script-build-script-{}.json",
+            self.entrypoint_module_name()?
+        ))
+    }
+
+    pub fn fingerprint_hash_file(&self) -> Result<RelFilePath> {
+        self.info.fingerprint_dir()?.try_join_file(format!(
+            "build-script-build-script-{}",
+            self.entrypoint_module_name()?
+        ))
+    }
 }
 
 #[derive(Debug, Clone, Eq, PartialEq, Hash, Serialize, Deserialize)]
@@ -621,20 +776,44 @@ pub struct BuildScriptExecutionUnitPlan {
     // units[^1].
     //
     // [^1]: https://github.com/attunehq/cargo/blob/7a93b36f1ae2f524d93efd16cd42864675f3e15b/src/cargo/core/compiler/fingerprint/mod.rs#L1665
+    pub info: UnitPlanInfo,
 
-    /// The compiled build script program being executed.
-    pub program: AbsFilePath,
-    /// The OUT_DIR where user-defined build script output files should be
-    /// written.
-    ///
-    /// This is parsed from the environment variables in the unit's
-    /// execution.
-    ///
-    /// This folder must have its mtime modified to be later than the
-    /// fingerprint's invoked timestamp for the unit to be marked fresh.
-    // TODO: We don't actually need this field given that we've already parsed
-    // the unit hash out, right? Because we can reconstruct this path.
-    pub out_dir: AbsDirPath,
+    /// The entrypoint module name of the compiled build script program after
+    /// linkage (i.e. using the original build script name, which is what Cargo
+    /// uses to name the execution unit files).
+    pub build_script_program_name: String,
+}
+
+impl BuildScriptExecutionUnitPlan {
+    pub fn fingerprint_json_file(&self) -> Result<RelFilePath> {
+        self.info.fingerprint_dir()?.try_join_file(format!(
+            "run-build-script-{}.json",
+            self.build_script_program_name
+        ))
+    }
+
+    pub fn fingerprint_hash_file(&self) -> Result<RelFilePath> {
+        self.info.fingerprint_dir()?.try_join_file(format!(
+            "run-build-script-{}",
+            self.build_script_program_name
+        ))
+    }
+
+    pub fn out_dir(&self) -> Result<RelDirPath> {
+        Ok(self.info.build_dir()?.join(mk_rel_dir!("out")))
+    }
+
+    pub fn stdout_file(&self) -> Result<RelFilePath> {
+        Ok(self.info.build_dir()?.join(mk_rel_file!("output")))
+    }
+
+    pub fn stderr_file(&self) -> Result<RelFilePath> {
+        Ok(self.info.build_dir()?.join(mk_rel_file!("stderr")))
+    }
+
+    pub fn root_output_file(&self) -> Result<RelFilePath> {
+        Ok(self.info.build_dir()?.join(mk_rel_file!("root-output")))
+    }
 }
 
 #[cfg(test)]
