@@ -6,6 +6,7 @@ use color_eyre::{
     eyre::{Context, OptionExt as _, bail, eyre},
 };
 use derive_more::{Debug as DebugExt, Display};
+use itertools::Itertools as _;
 use scopeguard::defer;
 use serde::{Deserialize, Serialize};
 use tap::{Conv as _, Pipe as _, Tap as _, TapFallible as _};
@@ -16,35 +17,39 @@ use uuid::Uuid;
 use crate::{
     cargo::{
         self, BuildPlan, BuildScriptOutput, CargoBuildArguments, CargoCompileMode, Profile,
-        RustcArgument, RustcMetadata, RustcTarget,
+        RustcArguments, RustcMetadata, RustcTarget,
     },
     fs, mk_rel_dir, mk_rel_file,
-    path::{AbsDirPath, AbsFilePath, JoinWith as _, TryJoinWith as _},
+    path::{
+        AbsDirPath, AbsFilePath, JoinWith as _, RelDirPath, RelFilePath, RelativeTo as _,
+        TryJoinWith as _,
+    },
 };
 
 /// The Cargo workspace of a build.
 ///
-/// Workspaces contain all the paths needed to unambiguously specify the files
-/// in a build. Note that workspaces are constructed with a specific profile in
-/// mind, which we parse from the build command's arguments.
+/// Workspaces contain all of the information needed to unambiguously specify
+/// the files in a build. Note that workspaces are constructed with a specific
+/// invocation in mind, since we parse some of its configuration fields from a
+/// build invocation's arguments.
 #[derive(Clone, Eq, PartialEq, Hash, DebugExt, Display, Serialize, Deserialize)]
 #[display("{root}")]
 pub struct Workspace {
     /// The root directory of the workspace.
-    #[debug("{root}")]
     pub root: AbsDirPath,
 
-    /// The target directory in the workspace.
-    #[debug("{target}")]
-    pub target: AbsDirPath,
+    /// The build directory of the workspace.
+    ///
+    /// Usually `target` unless user-configured.
+    ///
+    /// We use the "build dir" terminology from Cargo's upcoming split between
+    /// final and intermediate build artifacts[^1].
+    ///
+    /// [^1]: https://github.com/rust-lang/cargo/issues/6790
+    pub build_dir: AbsDirPath,
 
     /// The $CARGO_HOME value.
-    #[debug("{cargo_home}")]
     pub cargo_home: AbsDirPath,
-
-    /// The profile directory for host platform artifacts.
-    #[debug("{profile_dir}")]
-    pub profile_dir: AbsDirPath,
 
     /// The build profile of this workspace invocation.
     pub profile: Profile,
@@ -110,7 +115,7 @@ impl Workspace {
     ) -> Result<Self> {
         let args = args.as_ref();
 
-        let (workspace_root, workspace_target) = {
+        let (root, build_dir) = {
             // TODO: Maybe we should just replicate this logic and perform it
             // statically using filesystem operations instead of shelling out?
             // This costs something on the order of 200ms, which is not
@@ -143,7 +148,7 @@ impl Workspace {
         };
 
         let cargo_home = spawn_blocking({
-            let workspace_root = workspace_root.clone();
+            let workspace_root = root.clone();
             move || home::cargo_home_with_cwd(workspace_root.as_std_path())
         })
         .await
@@ -153,15 +158,13 @@ impl Workspace {
         .context("parse path as utf8")?;
 
         let profile = args.profile().map(Profile::from).unwrap_or(Profile::Debug);
-        let profile_dir = workspace_target.try_join_dir(profile.as_str())?;
         let target_arch = args.target();
 
         Ok(Self {
-            root: workspace_root,
-            target: workspace_target,
+            root,
+            build_dir,
             cargo_home,
             profile,
-            profile_dir,
             target_arch,
         })
     }
@@ -176,21 +179,10 @@ impl Workspace {
         Self::from_argv_in_dir(&pwd, args).await
     }
 
-    /// Get the build directory for this workspace. Note that we use the "build
-    /// dir" terminology from Cargo's upcoming split between final and
-    /// intermediate build artifacts[^1].
-    ///
-    /// [^1]: https://github.com/rust-lang/cargo/issues/6790
-    pub fn build_dir(&self) -> AbsDirPath {
-        // TODO: Support all sorts of configuration flags and environment
-        // variables that can modify this directory's location.
-        self.root.join(mk_rel_dir!("target"))
-    }
-
     /// Get the profile directory for intermediate build artifacts built for the
     /// host architecture.
     pub fn host_profile_dir(&self) -> AbsDirPath {
-        self.build_dir()
+        self.build_dir
             .try_join_dir(self.profile.as_str())
             .expect("profile should be valid directory name")
     }
@@ -205,7 +197,7 @@ impl Workspace {
     pub fn target_profile_dir(&self) -> AbsDirPath {
         match &self.target_arch {
             RustcTarget::Specified(target_arch) => self
-                .build_dir()
+                .build_dir
                 .try_join_dirs(vec![target_arch.as_str(), self.profile.as_str()])
                 .expect("target arch and profile should be valid directory names"),
             RustcTarget::ImplicitHost => self.host_profile_dir(),
@@ -228,11 +220,11 @@ impl Workspace {
             .root
             .try_join_dir(format!("target.backup.{}", Uuid::new_v4()))?;
 
-        let renamed = fs::rename(&self.target, &temp).await.is_ok();
+        let renamed = fs::rename(&self.build_dir, &temp).await.is_ok();
 
         defer! {
             if renamed {
-                let target = self.target.as_std_path();
+                let target = self.build_dir.as_std_path();
                 #[allow(clippy::disallowed_methods, reason = "cannot use async in defer")]
                 let _ = std::fs::remove_dir_all(target);
                 #[allow(clippy::disallowed_methods, reason = "cannot use async in defer")]
@@ -274,6 +266,306 @@ impl Workspace {
                     .to_string()
                     .header("Stderr:")
             })
+    }
+
+    #[instrument(name = "Workspace::units")]
+    pub async fn units(
+        &self,
+        // TODO: These should just use self.args.
+        args: impl AsRef<CargoBuildArguments> + std::fmt::Debug,
+    ) -> Result<Vec<UnitPlan>> {
+        let rustc = RustcMetadata::from_argv(&self.root, &args)
+            .await
+            .context("parsing rustc metadata")?;
+        trace!(?rustc, "rustc metadata");
+
+        // Note that build plans as a feature are deprecated[^1]. If a stable
+        // alternative comes along, we should migrate.
+        //
+        // An alternative is the `--unit-graph` flag, which is unstable but not
+        // deprecated[^2]. Unfortunately, unit graphs do not provide information
+        // about the `rustc` invocation argv or the unit hash of the build
+        // script execution, both of which are necessary to construct the
+        // artifact cache key. We could theoretically reconstruct this
+        // information using the JSON build messages and RUSTC_WRAPPER
+        // invocation recording, but that's way more work for no stronger of a
+        // stability guarantee.
+        //
+        // [^1]: https://github.com/rust-lang/cargo/issues/7614
+        // [^2]: https://doc.rust-lang.org/cargo/reference/unstable.html#unit-graph
+        let build_plan = self.build_plan(&args).await?;
+        trace!(?build_plan, "build plan");
+
+        let mut units: Vec<UnitPlan> = Vec::new();
+        for mut invocation in build_plan.invocations {
+            trace!(?invocation, "build plan invocation");
+
+            // Skip first-party workspace members. We only cache third-party
+            // dependencies. `CARGO_PRIMARY_PACKAGE` is set if the user
+            // specifically requested the item to be built[^1]; while it's
+            // technically possible for the user to do so for a third-party
+            // dependency that's relatively rare (and arguably if they're asking
+            // to compile it specifically, it _should_ probably be exempt from
+            // cache).
+            //
+            // [^1]: https://doc.rust-lang.org/cargo/reference/environment-variables.html#:~:text=CARGO_PRIMARY_PACKAGE
+            if let Some(v) = invocation.env.get("CARGO_PRIMARY_PACKAGE")
+                && v == "1"
+            {
+                trace!("skipping: first party workspace member");
+                continue;
+            }
+
+            // But also, `CARGO_PRIMARY_PACKAGE` is not set for execution (as
+            // opposed to compilation) units[^1]! So we use this heuristic as a
+            // fallback.
+            //
+            // [^1]: https://doc.rust-lang.org/cargo/reference/environment-variables.html#:~:text=This%20is%20only%20set%20when%20compiling%20the%20package%20(not%20when%20running%20binaries%20or%20tests).
+            if invocation
+                .cwd
+                .pipe(AbsFilePath::try_from)?
+                .relative_to(&self.cargo_home)
+                .is_err()
+            {
+                trace!("skipping: package outside of $CARGO_HOME");
+                continue;
+            }
+
+            // Figure out what kind of unit this invocation is.
+            let package_name = invocation.package_name;
+            let target_arch = invocation.target_arch;
+            // FIXME: To support `patch` and `replace` directives when rewriting
+            // fingerprints, we need to know the extern_crate_name for each
+            // dependency edge of the unit. It is not sufficient to merely know
+            // the declared crate_name of the dependency. But we should be able
+            // to parse out an extern_crate_name by parsing the `--extern` flags
+            // in the invocation rustc arguments for known library output paths.
+            let deps = invocation.deps.into_iter().map(|d| d as u32).collect();
+            let unit = if invocation.target_kind == [TargetKind::CustomBuild] {
+                match invocation.compile_mode {
+                    CargoCompileMode::Build => {
+                        // Build scripts always compile to a single program and
+                        // a renamed hard link to the same program.
+                        //
+                        // This is parsed from the `outputs` and `links` paths
+                        // in the unit's build plan invocation.
+                        //
+                        // These file paths must have their mtimes modified to
+                        // be later than the fingerprint's invoked timestamp for
+                        // the unit to be marked fresh.
+                        //
+                        // In the actual unit struct, we reconstruct these
+                        // values from the build script main entry point module
+                        // name. But here, we parse the values out of the build
+                        // plan and check that our reconstructions are accurate
+                        // as a sanity check.
+                        let compiled_program = invocation
+                            .outputs
+                            .into_iter()
+                            // Filter out DWARF debugging files, which Cargo removes
+                            // anyway.
+                            .filter(|o| !o.ends_with(".dwp"))
+                            .map(|o| AbsFilePath::try_from(o))
+                            .exactly_one()
+                            .unwrap_or_else(|_| {
+                                bail!("build script compilation should produce exactly one output");
+                            })?;
+                        // Resolve `links`. We can just take the keys because we
+                        // know they point to valid target files, and there's
+                        // only one target file (the compiled program) that we
+                        // care about anyway.
+                        let linked_program = invocation
+                            .links
+                            .keys()
+                            .into_iter()
+                            .filter(|l| !l.ends_with(".dwp"))
+                            .map(|l| AbsFilePath::try_from(l))
+                            .exactly_one()
+                            .unwrap_or_else(|_| {
+                                bail!("build script compilation should produce exactly one output");
+                            })?;
+                        // Parse unit hash from file name of
+                        // `build_script_{entrypoint_module_name}-{hash}`.
+                        //
+                        // We could also parse this from `-C extra-filename`.
+                        let unit_hash = compiled_program
+                            .file_name_str_lossy()
+                            .ok_or_eyre("program file has no name")?
+                            .rsplit_once('-')
+                            .ok_or_eyre("program file has no unit hash")?
+                            .1
+                            .to_string();
+                        let args = RustcArguments::from_iter(invocation.args);
+                        let crate_name = args
+                            .crate_name()
+                            .ok_or_eyre("build script compilation should have a crate name")?
+                            .to_string();
+                        let src_path = args.src_path().pipe(AbsFilePath::try_from)?;
+                        // Sanity check that constructed values match parsed
+                        // values.
+                        if target_arch != RustcTarget::ImplicitHost {
+                            bail!(
+                                "build script compilation has specified --target architecture {:?}",
+                                target_arch
+                            );
+                        }
+                        let profile_dir = self.host_profile_dir();
+                        let bsc_unit = BuildScriptCompilationUnitPlan {
+                            info: UnitPlanInfo {
+                                unit_hash,
+                                package_name,
+                                crate_name,
+                                target_arch,
+                                deps,
+                            },
+                            src_path,
+                        };
+                        if bsc_unit.program_file()? != compiled_program.relative_to(&profile_dir)? {
+                            bail!("build script program filepath reconstruction mismatch");
+                        }
+                        if bsc_unit.linked_program_file()?
+                            != linked_program.relative_to(&profile_dir)?
+                        {
+                            bail!(
+                                "build script program hard link filepath reconstruction mismatch"
+                            );
+                        }
+                        UnitPlan::BuildScriptCompilation(bsc_unit)
+                    }
+                    CargoCompileMode::RunCustomBuild => {
+                        let program = invocation.program.pipe(AbsFilePath::try_from)?;
+                        let out_dir = invocation
+                            .env
+                            .remove("OUT_DIR")
+                            .ok_or_eyre("build script execution should set OUT_DIR")?
+                            .pipe(AbsDirPath::try_from)?;
+                        let unit_dir = out_dir.parent().ok_or_eyre("OUT_DIR should have parent")?;
+                        let unit_hash = unit_dir
+                            .file_name_str_lossy()
+                            .ok_or_eyre("build script execution directory should have name")?
+                            .rsplit_once('-')
+                            .ok_or_eyre("build script execution directory should have unit hash")?
+                            .1
+                            .to_string();
+                        // Cargo defines the "crate name" of build script
+                        // execution as the crate name of the build script being
+                        // executed, which we infer from the name of the
+                        // compiled program.
+                        let crate_name = program
+                            .file_name_str_lossy()
+                            .ok_or_eyre("build script program should have name")?
+                            .to_string()
+                            // This is from Cargo's normalization logic.[^1]
+                            //
+                            // [^1]: https://github.com/attunehq/cargo/blob/7a93b36f1ae2f524d93efd16cd42864675f3e15b/src/cargo/core/manifest.rs#L961
+                            .replace("-", "_");
+                        let build_script_program_name = program
+                            .file_name_str_lossy()
+                            .ok_or_eyre("build script program should have name")?
+                            .to_string();
+                        // Sanity check that constructed values match parsed
+                        // values.
+                        let profile_dir = match target_arch {
+                            RustcTarget::Specified(_) if target_arch == self.target_arch => {
+                                self.target_profile_dir()
+                            }
+                            RustcTarget::ImplicitHost => self.host_profile_dir(),
+                            RustcTarget::Specified(_) => bail!(
+                                "unit architecture {:?} does not match --target architecture {:?}",
+                                target_arch,
+                                self.target_arch
+                            ),
+                        };
+                        let bse_unit = BuildScriptExecutionUnitPlan {
+                            info: UnitPlanInfo {
+                                unit_hash,
+                                package_name,
+                                crate_name,
+                                target_arch,
+                                deps,
+                            },
+                            build_script_program_name,
+                        };
+                        if bse_unit.out_dir()? != out_dir.relative_to(&profile_dir)? {
+                            bail!("build script out_dir reconstruction mismatch");
+                        }
+
+                        UnitPlan::BuildScriptExecution(bse_unit)
+                    }
+                    _ => bail!(
+                        "unknown compile mode for build script: {:?}",
+                        invocation.compile_mode
+                    ),
+                }
+            } else if invocation.target_kind == [TargetKind::Bin] {
+                // Binaries are _always_ first-party code. Do nothing for now.
+                continue;
+            } else if invocation.target_kind.contains(&TargetKind::Lib)
+                || invocation.target_kind.contains(&TargetKind::RLib)
+                || invocation.target_kind.contains(&TargetKind::CDyLib)
+                || invocation.target_kind.contains(&TargetKind::ProcMacro)
+            {
+                // Sanity check: everything here should be a dependency being
+                // compiled.
+                if invocation.compile_mode != CargoCompileMode::Build {
+                    bail!(
+                        "unknown compile mode for dependency: {:?}",
+                        invocation.compile_mode
+                    );
+                }
+
+                // Filter out DWARF debugging files, which Cargo removes anyway.
+                // These are created for proc macros and cdylibs on Linux (they
+                // are `.so.dwp` files).
+                //
+                // Note there is no need to resolve `links` for library crates.
+                // They are never linked unless they are first-party, and we are
+                // skipping first-party crates for now anyway.
+                let outputs = invocation
+                    .outputs
+                    .into_iter()
+                    .filter(|o| !o.ends_with(".dwp"))
+                    .map(|o| AbsFilePath::try_from(o))
+                    .collect::<Result<Vec<_>>>()?;
+                let args = RustcArguments::from_iter(invocation.args);
+                let crate_name = args.crate_name().ok_or_eyre("no crate name")?.to_owned();
+                let src_path = args.src_path().pipe(AbsFilePath::try_from)?;
+                // We could also parse this from `-C extra-filename`.
+                let unit_hash = {
+                    let compiled_file = outputs.first().ok_or_eyre("no compiled files")?;
+                    let filename = compiled_file
+                        .file_name()
+                        .ok_or_eyre("no filename")?
+                        .to_string_lossy();
+                    let filename = filename.split_once('.').ok_or_eyre("no extension")?.0;
+
+                    filename
+                        .rsplit_once('-')
+                        .ok_or_eyre(format!(
+                            "no unit hash suffix in filename: {filename} (all files: {outputs:?})"
+                        ))?
+                        .1
+                        .to_string()
+                };
+
+                UnitPlan::LibraryCrate(LibraryCrateUnitPlan {
+                    info: UnitPlanInfo {
+                        unit_hash,
+                        package_name,
+                        crate_name,
+                        target_arch,
+                        deps,
+                    },
+                    src_path,
+                    outputs,
+                })
+            } else {
+                bail!("unsupported target kind: {:?}", invocation.target_kind);
+            };
+            units.push(unit);
+        }
+
+        Ok(units)
     }
 
     #[instrument(name = "Workspace::artifact_plan")]
@@ -531,10 +823,7 @@ impl Workspace {
                     deps = ?invocation.deps,
                     "artifacts to save"
                 );
-                let target = invocation.args.iter().find_map(|arg| match arg {
-                    RustcArgument::Target(target) => Some(target.clone()),
-                    _ => None,
-                });
+                let target = invocation.target_arch.into();
 
                 artifacts.push(ArtifactKey {
                     package_name: invocation.package_name,
@@ -698,10 +987,8 @@ impl BuiltArtifact {
         };
 
         let profile_dir = match &key.target {
-            Some(target) => ws
-                .target
-                .try_join_dirs([target.as_str(), key.profile.as_str()])?,
-            None => ws.profile_dir.clone(),
+            Some(_) => ws.target_profile_dir(),
+            None => ws.host_profile_dir(),
         };
 
         // TODO: Use this later to reconstruct the rustc invocation, and use all
@@ -724,6 +1011,278 @@ impl BuiltArtifact {
     /// The computed profile directory for the _library crate_ of the artifact.
     pub fn profile_dir(&self) -> &AbsDirPath {
         &self.profile_dir
+    }
+}
+
+/// Fields which are shared between all unit plan types.
+#[derive(Debug, Clone, Eq, PartialEq, Hash, Serialize, Deserialize)]
+pub struct UnitPlanInfo {
+    /// The directory hash of the unit, which is used to construct the unit's
+    /// file directories.
+    ///
+    /// See the `*_dir` methods on `CompilationFiles`[^1] for details.
+    ///
+    /// [^1]: https://github.com/attunehq/cargo/blob/7a93b36f1ae2f524d93efd16cd42864675f3e15b/src/cargo/core/compiler/build_runner/compilation_files.rs#L117
+    pub unit_hash: String,
+
+    /// The package name of this unit.
+    ///
+    /// This is used to reconstruct expected output directories. See the `*_dir`
+    /// methods on `CompilationFiles`[^1] for details.
+    ///
+    /// [^1]: https://github.com/attunehq/cargo/blob/7a93b36f1ae2f524d93efd16cd42864675f3e15b/src/cargo/core/compiler/build_runner/compilation_files.rs#L117
+    pub package_name: String,
+
+    /// The crate name of this unit.
+    ///
+    /// Note that this is not necessarily the _extern_ crate name, which can be
+    /// affected by directives like `replace` and `patch`, and that the crate
+    /// name used in fingerprints is the extern crate name[^1], not the
+    /// canonical crate name.
+    ///
+    /// [^1]: https://github.com/attunehq/cargo/blob/7a93b36f1ae2f524d93efd16cd42864675f3e15b/src/cargo/core/compiler/fingerprint/mod.rs#L1366
+    // FIXME: To properly support `replace` and `patch` directives, we need to
+    // also calculate an extern_crate_name for each edge in the dependency
+    // graph. Note that this is a per-edge value, not a per-unit value. Perhaps
+    // we can derive this from the unit graph?
+    pub crate_name: String,
+
+    /// The unit's target architecture, if set.
+    ///
+    /// When None, this unit is not being compiled with a specific `--target` in
+    /// mind, and therefore is being compiled for the host architecture.
+    ///
+    /// Note that some units (e.g. proc macros, build script compilations, and
+    /// dependencies thereof) are compiled for the host architecture even when
+    /// `--target` is set to a different architecture. This field already takes
+    /// that into account.
+    pub target_arch: RustcTarget,
+
+    /// The dependencies of this unit.
+    ///
+    /// This is parsed from the dependencies in the unit's build plan
+    /// invocation. Note that units can depend on arbitrary other units. For
+    /// example, build script executions can depend on other build script
+    /// executions because of the `links` field[^1] or library crates if they
+    /// use those libraries.
+    ///
+    /// This is used to rewrite the unit's fingerprint on restore by rewriting
+    /// the fingerprints in the `deps` field.
+    ///
+    /// [^1]: https://doc.rust-lang.org/cargo/reference/build-scripts.html#the-links-manifest-key
+    pub deps: Vec<u32>,
+}
+
+impl UnitPlanInfo {
+    /// The dependency artifacts directory, relative to the unit's profile
+    /// directory. This is used for library units.
+    pub fn deps_dir(&self) -> Result<RelDirPath> {
+        Ok(mk_rel_dir!("deps"))
+    }
+
+    /// The fingerprint directory, relative to the unit's profile directory.
+    /// This is used for all units.
+    pub fn fingerprint_dir(&self) -> Result<RelDirPath> {
+        mk_rel_dir!(".fingerprint")
+            .try_join_dir(format!("{}-{}", self.package_name, self.unit_hash))
+    }
+
+    /// The build script directory, relative to the unit's profile directory.
+    /// This is used for build script compilation and execution units.
+    pub fn build_dir(&self) -> Result<RelDirPath> {
+        mk_rel_dir!("build").try_join_dir(format!("{}-{}", self.package_name, self.unit_hash))
+    }
+}
+
+/// Mode-specific information about this unit.
+///
+/// This is similar to an amalgamation of TargetKind[^1] and
+/// CompileMode[^2].
+///
+/// Note that we separate compiling library crates from build scripts (even
+/// though they are the same CompileMode) because they store artifacts at
+/// different paths in the build directory.
+///
+/// [^1]: https://github.com/attunehq/cargo/blob/7a93b36f1ae2f524d93efd16cd42864675f3e15b/src/cargo/core/manifest.rs#L215
+/// [^2]: https://github.com/attunehq/cargo/blob/7a93b36f1ae2f524d93efd16cd42864675f3e15b/src/cargo/core/compiler/build_config.rs#L171
+#[derive(Debug, Clone, Eq, PartialEq, Hash, Serialize, Deserialize)]
+pub enum UnitPlan {
+    LibraryCrate(LibraryCrateUnitPlan),
+    BuildScriptCompilation(BuildScriptCompilationUnitPlan),
+    BuildScriptExecution(BuildScriptExecutionUnitPlan),
+}
+
+impl UnitPlan {
+    pub fn info(&self) -> &UnitPlanInfo {
+        match self {
+            UnitPlan::LibraryCrate(plan) => &plan.info,
+            UnitPlan::BuildScriptCompilation(plan) => &plan.info,
+            UnitPlan::BuildScriptExecution(plan) => &plan.info,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Eq, PartialEq, Hash, Serialize, Deserialize)]
+pub struct LibraryCrateUnitPlan {
+    pub info: UnitPlanInfo,
+    pub src_path: AbsFilePath,
+    pub outputs: Vec<AbsFilePath>,
+}
+
+impl LibraryCrateUnitPlan {
+    pub fn dep_info_file(&self) -> Result<RelFilePath> {
+        self.info.deps_dir()?.try_join_file(format!(
+            "{}-{}.d",
+            self.info.crate_name, self.info.unit_hash
+        ))
+    }
+
+    pub fn encoded_dep_info_file(&self) -> Result<RelFilePath> {
+        self.info
+            .fingerprint_dir()?
+            .try_join_file(format!("dep-lib-{}", self.info.crate_name))
+    }
+
+    pub fn fingerprint_json_file(&self) -> Result<RelFilePath> {
+        self.info
+            .fingerprint_dir()?
+            .try_join_file(format!("lib-{}.json", self.info.crate_name))
+    }
+
+    pub fn fingerprint_hash_file(&self) -> Result<RelFilePath> {
+        self.info
+            .fingerprint_dir()?
+            .try_join_file(format!("lib-{}", self.info.crate_name))
+    }
+}
+
+#[derive(Debug, Clone, Eq, PartialEq, Hash, Serialize, Deserialize)]
+pub struct BuildScriptCompilationUnitPlan {
+    pub info: UnitPlanInfo,
+
+    /// The path to the build script's main entrypoint source file. This is
+    /// usually `build.rs` within the package's source code, but can vary if
+    /// the package author sets `package.build` in the package's
+    /// `Cargo.toml`, which changes the build script's name[^1].
+    ///
+    /// This is parsed from the rustc invocation arguments in the unit's
+    /// build plan invocation.
+    ///
+    /// This is used to rewrite the build script compilation's fingerprint
+    /// on restore.
+    ///
+    /// [^1]: https://doc.rust-lang.org/cargo/reference/manifest.html#the-build-field
+    pub src_path: AbsFilePath,
+}
+
+impl BuildScriptCompilationUnitPlan {
+    fn entrypoint_module_name(&self) -> Result<String> {
+        let src_path_filename = self
+            .src_path
+            .file_name_str_lossy()
+            .ok_or_eyre("build script source path has no name")?;
+        Ok(src_path_filename
+            .strip_suffix(".rs")
+            .ok_or_eyre("build script source path has no `.rs` extension")?
+            .to_string())
+    }
+
+    /// Build scripts always compile to a single program and a renamed hard
+    /// link to the same program.
+    ///
+    /// This is parsed from the `outputs` and `links` paths in the unit's
+    /// build plan invocation.
+    ///
+    /// These file paths must have their mtimes modified to be later than
+    /// the fingerprint's invoked timestamp for the unit to be marked fresh.
+    pub fn program_file(&self) -> Result<RelFilePath> {
+        self.info.build_dir()?.try_join_file(format!(
+            "build_script_{}-{}",
+            self.entrypoint_module_name()?.replace("-", "_"),
+            self.info.unit_hash
+        ))
+    }
+
+    pub fn linked_program_file(&self) -> Result<RelFilePath> {
+        self.info
+            .build_dir()?
+            .try_join_file(format!("build-script-{}", self.entrypoint_module_name()?))
+    }
+
+    pub fn dep_info_file(&self) -> Result<RelFilePath> {
+        self.info.build_dir()?.try_join_file(format!(
+            "build_script_{}-{}.d",
+            self.entrypoint_module_name()?.replace("-", "_"),
+            self.info.unit_hash
+        ))
+    }
+
+    pub fn encoded_dep_info_file(&self) -> Result<RelFilePath> {
+        self.info.fingerprint_dir()?.try_join_file(format!(
+            "dep-build-script-build-script-{}",
+            self.entrypoint_module_name()?
+        ))
+    }
+
+    pub fn fingerprint_json_file(&self) -> Result<RelFilePath> {
+        self.info.fingerprint_dir()?.try_join_file(format!(
+            "build-script-build-script-{}.json",
+            self.entrypoint_module_name()?
+        ))
+    }
+
+    pub fn fingerprint_hash_file(&self) -> Result<RelFilePath> {
+        self.info.fingerprint_dir()?.try_join_file(format!(
+            "build-script-build-script-{}",
+            self.entrypoint_module_name()?
+        ))
+    }
+}
+
+#[derive(Debug, Clone, Eq, PartialEq, Hash, Serialize, Deserialize)]
+pub struct BuildScriptExecutionUnitPlan {
+    // Note that we don't save src_path for build script execution because this
+    // field is always set to `""` in the fingerprint for build script execution
+    // units[^1].
+    //
+    // [^1]: https://github.com/attunehq/cargo/blob/7a93b36f1ae2f524d93efd16cd42864675f3e15b/src/cargo/core/compiler/fingerprint/mod.rs#L1665
+    pub info: UnitPlanInfo,
+
+    /// The entrypoint module name of the compiled build script program after
+    /// linkage (i.e. using the original build script name, which is what Cargo
+    /// uses to name the execution unit files).
+    pub build_script_program_name: String,
+}
+
+impl BuildScriptExecutionUnitPlan {
+    pub fn fingerprint_json_file(&self) -> Result<RelFilePath> {
+        self.info.fingerprint_dir()?.try_join_file(format!(
+            "run-build-script-{}.json",
+            self.build_script_program_name
+        ))
+    }
+
+    pub fn fingerprint_hash_file(&self) -> Result<RelFilePath> {
+        self.info.fingerprint_dir()?.try_join_file(format!(
+            "run-build-script-{}",
+            self.build_script_program_name
+        ))
+    }
+
+    pub fn out_dir(&self) -> Result<RelDirPath> {
+        Ok(self.info.build_dir()?.join(mk_rel_dir!("out")))
+    }
+
+    pub fn stdout_file(&self) -> Result<RelFilePath> {
+        Ok(self.info.build_dir()?.join(mk_rel_file!("output")))
+    }
+
+    pub fn stderr_file(&self) -> Result<RelFilePath> {
+        Ok(self.info.build_dir()?.join(mk_rel_file!("stderr")))
+    }
+
+    pub fn root_output_file(&self) -> Result<RelFilePath> {
+        Ok(self.info.build_dir()?.join(mk_rel_file!("root-output")))
     }
 }
 

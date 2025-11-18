@@ -414,7 +414,7 @@ mod tests {
     use simple_test_case::test_case;
 
     fn replace_path_placeholders(line: &str, ws: &Workspace) -> String {
-        line.replace("__PROFILE__", &ws.profile_dir.to_string())
+        line.replace("__PROFILE__", &ws.host_profile_dir().to_string())
             .replace("__CARGO__", &ws.cargo_home.to_string())
     }
 

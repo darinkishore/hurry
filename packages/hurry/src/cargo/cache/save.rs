@@ -177,7 +177,7 @@ async fn collect_build_script_files(
     let compiled_files = fs::walk_files(&build_script_files.compiled_dir)
         .try_collect::<Vec<_>>()
         .await?;
-    let compiled_fingerprint_dir = ws.profile_dir.try_join_dirs(&[
+    let compiled_fingerprint_dir = ws.host_profile_dir().try_join_dirs(&[
         String::from(".fingerprint"),
         format!(
             "{}-{}",
