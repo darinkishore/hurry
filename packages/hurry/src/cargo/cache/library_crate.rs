@@ -57,23 +57,21 @@ pub struct LibraryFiles {
 }
 
 impl LibraryFiles {
-    async fn save(ws: &Workspace, lib_unit: &LibraryCrateUnitPlan) -> Result<Self> {
-        let outputs = &lib_unit.outputs;
-        let unit_info = &lib_unit.info;
-        let profile_dir = ws.unit_profile_dir(&unit_info);
+    async fn save(ws: &Workspace, unit_plan: &LibraryCrateUnitPlan) -> Result<Self> {
+        let profile_dir = ws.unit_profile_dir(&unit_plan.info);
 
         // There should only be 1-3 files here, it's a very small number.
         let output_files = {
             let mut output_files = Vec::new();
-            for output_file_path in outputs.into_iter() {
+            for output_file_path in &unit_plan.outputs {
                 let path = QualifiedPath::parse(
                     ws,
-                    &unit_info.target_arch,
+                    &unit_plan.info.target_arch,
                     &output_file_path.clone().into(),
                 )
                 .await?;
-                let contents = fs::must_read_buffered(&output_file_path).await?;
-                let executable = fs::is_executable(&output_file_path.as_std_path()).await;
+                let contents = fs::must_read_buffered(output_file_path).await?;
+                let executable = fs::is_executable(output_file_path.as_std_path()).await;
                 output_files.push(SavedFile {
                     path,
                     contents,
@@ -85,22 +83,22 @@ impl LibraryFiles {
 
         let dep_info_file = DepInfo::from_file(
             ws,
-            &unit_info.target_arch,
-            &profile_dir.join(&lib_unit.dep_info_file()?),
+            &unit_plan.info.target_arch,
+            &profile_dir.join(&unit_plan.dep_info_file()?),
         )
         .await?;
 
         let encoded_dep_info_file =
-            fs::must_read_buffered(&profile_dir.join(&lib_unit.encoded_dep_info_file()?)).await?;
+            fs::must_read_buffered(&profile_dir.join(&unit_plan.encoded_dep_info_file()?)).await?;
 
         let fingerprint = {
             let fingerprint_json =
-                fs::must_read_buffered_utf8(&profile_dir.join(&lib_unit.fingerprint_json_file()?))
+                fs::must_read_buffered_utf8(&profile_dir.join(&unit_plan.fingerprint_json_file()?))
                     .await?;
             let fingerprint: Fingerprint = serde_json::from_str(&fingerprint_json)?;
 
             let fingerprint_hash =
-                fs::must_read_buffered_utf8(&profile_dir.join(&lib_unit.fingerprint_hash_file()?))
+                fs::must_read_buffered_utf8(&profile_dir.join(&unit_plan.fingerprint_hash_file()?))
                     .await?;
 
             // Sanity check that the fingerprint hashes match.
@@ -123,15 +121,15 @@ impl LibraryFiles {
         self,
         ws: &Workspace,
         dep_fingerprints: &mut HashMap<u64, Arc<Fingerprint>>,
-        lib_unit: &LibraryCrateUnitPlan,
+        unit_plan: &LibraryCrateUnitPlan,
     ) -> Result<()> {
-        let profile_dir = ws.unit_profile_dir(&lib_unit.info);
+        let profile_dir = ws.unit_profile_dir(&unit_plan.info);
 
         // Restore output files.
         for saved_file in self.output_files {
             let path = saved_file
                 .path
-                .reconstruct(ws, &lib_unit.info.target_arch)
+                .reconstruct(ws, &unit_plan.info.target_arch)
                 .map(AbsFilePath::try_from)??;
             fs::write(&path, saved_file.contents).await?;
             fs::set_executable(&path, saved_file.executable).await?;
@@ -139,16 +137,16 @@ impl LibraryFiles {
 
         // Restore encoded Cargo dep-info file.
         fs::write(
-            &profile_dir.join(&lib_unit.encoded_dep_info_file()?),
+            &profile_dir.join(&unit_plan.encoded_dep_info_file()?),
             self.encoded_dep_info_file,
         )
         .await?;
 
         // Reconstruct and restore rustc dep-info file.
         fs::write(
-            &profile_dir.join(&lib_unit.dep_info_file()?),
+            &profile_dir.join(&unit_plan.dep_info_file()?),
             self.dep_info_file
-                .reconstruct(ws, &lib_unit.info.target_arch)?,
+                .reconstruct(ws, &unit_plan.info.target_arch)?,
         )
         .await?;
 
@@ -157,8 +155,8 @@ impl LibraryFiles {
         let old_fingerprint_hash = saved_fingerprint.hash_u64();
 
         // First, rewrite the `path` field.
-        saved_fingerprint.path = fingerprint::util_hash_u64(PathBuf::from(&lib_unit.src_path));
-        debug!(path = ?PathBuf::from(&lib_unit.src_path), path_hash = ?saved_fingerprint.path, "rewritten fingerprint");
+        saved_fingerprint.path = fingerprint::util_hash_u64(PathBuf::from(&unit_plan.src_path));
+        debug!(path = ?PathBuf::from(&unit_plan.src_path), path_hash = ?saved_fingerprint.path, "rewritten fingerprint");
 
         // Then, rewrite the `deps` field.
         //
@@ -192,12 +190,12 @@ impl LibraryFiles {
 
         // Finally, write the reconstructed fingerprint.
         fs::write(
-            &profile_dir.join(&lib_unit.fingerprint_hash_file()?),
+            &profile_dir.join(&unit_plan.fingerprint_hash_file()?),
             fingerprint_hash,
         )
         .await?;
         fs::write(
-            &profile_dir.join(&lib_unit.fingerprint_json_file()?),
+            &profile_dir.join(&unit_plan.fingerprint_json_file()?),
             serde_json::to_vec(&saved_fingerprint)?,
         )
         .await?;

@@ -10,7 +10,7 @@ use uuid::Uuid;
 use crate::{
     cargo::{
         ArtifactPlan, BuildScriptCompilationUnitPlan, BuildScriptExecutionUnitPlan,
-        BuildScriptOutput, DepInfo, Fingerprint, LibraryCrateUnitPlan, QualifiedPath, Workspace,
+        LibraryCrateUnitPlan, QualifiedPath, Workspace,
         cache::{
             build_script_compilation::BuildScriptCompiledFiles,
             build_script_execution::BuildScriptOutputFiles, library_crate::LibraryFiles,
