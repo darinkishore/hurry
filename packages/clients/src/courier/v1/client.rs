@@ -1,6 +1,6 @@
 //! HTTP client for the Courier v1 API.
 
-use std::sync::Arc;
+use std::{collections::HashMap, sync::Arc};
 
 use async_compression::{
     Level,
@@ -31,7 +31,10 @@ use super::{
     },
     cas::{CasBulkReadRequest, CasBulkWriteResponse},
 };
-use crate::{ContentType, NETWORK_BUFFER_SIZE, Token};
+use crate::{
+    ContentType, NETWORK_BUFFER_SIZE, Token,
+    courier::v1::cache::{CargoRestoreRequest2, CargoRestoreResponse2, CargoSaveRequest2},
+};
 
 /// Maximum decompressed size for individual blob decompression (1GB).
 ///
@@ -58,7 +61,6 @@ pub struct Client {
 
     token: Token,
 }
-
 impl Client {
     /// Create a new client with the given base URL and authentication token.
     pub fn new(base: Url, token: Token) -> Result<Self> {
@@ -90,6 +92,171 @@ impl Client {
                     .with_section(|| url.header("Url:"))
                     .with_section(|| body.header("Body:"))
                     .with_section(|| request_id.header("Request ID:"));
+            }
+        }
+    }
+
+    /// Save cargo cache metadata.
+    ///
+    /// Important: this is temporarily stubbed using the local file system.
+    #[instrument(skip(self))]
+    pub async fn cargo_cache_save2(&self, body: CargoSaveRequest2) -> Result<()> {
+        tokio::fs::create_dir_all("/tmp/courier-v2-stub")
+            .await
+            .context("create stub directory")?;
+
+        for request in body {
+            let path = format!("/tmp/courier-v2-stub/{}.json", request.key.stable_hash());
+            let json = serde_json::to_vec_pretty(&request.unit).context("serialize unit")?;
+            tokio::fs::write(&path, json)
+                .await
+                .with_context(|| format!("write unit to {path}"))?;
+        }
+
+        Ok(())
+    }
+
+    /// Restore cargo cache metadata.
+    ///
+    /// Important: this is temporarily stubbed using the local file system.
+    #[instrument(skip(self))]
+    pub async fn cargo_cache_restore2(
+        &self,
+        body: CargoRestoreRequest2,
+    ) -> Result<Option<CargoRestoreResponse2>> {
+        let mut results = HashMap::new();
+        for key in body {
+            let path = format!("/tmp/courier-v2-stub/{}.json", key.stable_hash());
+            match tokio::fs::read(&path).await {
+                Ok(json) => {
+                    let unit = serde_json::from_slice(&json)
+                        .with_context(|| format!("deserialize unit from {path}"))?;
+                    results.insert(key.clone(), unit);
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    continue;
+                }
+                Err(e) => {
+                    return Err(e).with_context(|| format!("read unit from {path}"));
+                }
+            }
+        }
+
+        if results.is_empty() {
+            Ok(None)
+        } else {
+            CargoRestoreResponse2::from(results).pipe(Some).pipe(Ok)
+        }
+    }
+
+    /// Save cargo cache metadata.
+    #[instrument(skip(self))]
+    #[deprecated = "Replaced by `cargo_cache_save2`"]
+    pub async fn cargo_cache_save(&self, body: CargoSaveRequest) -> Result<()> {
+        let url = self.base.join("api/v1/cache/cargo/save")?;
+        let response = self
+            .http
+            .post(url)
+            .bearer_auth(self.token.expose())
+            .json(&body)
+            .send()
+            .await
+            .context("send")?;
+
+        match response.status() {
+            StatusCode::CREATED => Ok(()),
+            status => {
+                let url = response.url().to_string();
+                let request_id = request_id(&response);
+                let body = response.text().await.unwrap_or_default();
+                return Err(eyre!("unexpected status code: {status}"))
+                    .with_section(|| url.header("Url:"))
+                    .with_section(|| body.header("Body:"))
+                    .with_section(|| request_id.header("Request ID:"));
+            }
+        }
+    }
+
+    /// Restore cargo cache metadata.
+    #[instrument(skip(self))]
+    #[deprecated = "Replaced by `cargo_cache_restore2`"]
+    pub async fn cargo_cache_restore(
+        &self,
+        body: CargoRestoreRequest,
+    ) -> Result<Option<CargoRestoreResponse>> {
+        let url = self.base.join("api/v1/cache/cargo/restore")?;
+        let response = self
+            .http
+            .post(url)
+            .bearer_auth(self.token.expose())
+            .json(&body)
+            .send()
+            .await
+            .context("send")?;
+
+        match response.status() {
+            StatusCode::OK => {
+                let data = response
+                    .json::<CargoRestoreResponse>()
+                    .await
+                    .context("parse JSON response")?;
+                Ok(Some(data))
+            }
+            StatusCode::NOT_FOUND => Ok(None),
+            status => {
+                let url = response.url().to_string();
+                let request_id = request_id(&response);
+                let body = response.text().await.unwrap_or_default();
+                return Err(eyre!("unexpected status code: {status}"))
+                    .with_section(|| url.header("Url:"))
+                    .with_section(|| body.header("Body:"))
+                    .with_section(|| request_id.header("Request ID:"));
+            }
+        }
+    }
+
+    /// Restore multiple cargo cache entries in bulk.
+    ///
+    /// Note: The server supports up to 100,000 requests in a single bulk
+    /// operation. If you exceed this limit, the server will return a 400
+    /// Bad Request error.
+    #[instrument(skip(self, requests))]
+    #[deprecated = "Replaced by `cargo_cache_restore2`"]
+    pub async fn cargo_cache_restore_bulk(
+        &self,
+        requests: impl IntoIterator<Item = impl Into<CargoRestoreRequest>>,
+    ) -> Result<CargoBulkRestoreResponse> {
+        let url = self.base.join("api/v1/cache/cargo/bulk/restore")?;
+        let requests = requests.into_iter().map(Into::into).collect::<Vec<_>>();
+        let body = CargoBulkRestoreRequest::builder()
+            .requests(requests)
+            .build();
+
+        let response = self
+            .http
+            .post(url)
+            .bearer_auth(self.token.expose())
+            .json(&body)
+            .send()
+            .await
+            .context("send")?;
+
+        match response.status() {
+            StatusCode::OK => {
+                let data = response
+                    .json::<CargoBulkRestoreResponse>()
+                    .await
+                    .context("parse JSON response")?;
+                Ok(data)
+            }
+            status => {
+                let url = response.url().to_string();
+                let request_id = request_id(&response);
+                let body = response.text().await.unwrap_or_default();
+                Err(eyre!("unexpected status code: {status}"))
+                    .with_section(|| url.header("Url:"))
+                    .with_section(|| body.header("Body:"))
+                    .with_section(|| request_id.header("Request ID:"))
             }
         }
     }
@@ -186,115 +353,6 @@ impl Client {
                     .with_section(|| url.header("Url:"))
                     .with_section(|| body.header("Body:"))
                     .with_section(|| request_id.header("Request ID:"));
-            }
-        }
-    }
-
-    /// Save cargo cache metadata.
-    #[instrument(skip(self))]
-    pub async fn cargo_cache_save(&self, body: CargoSaveRequest) -> Result<()> {
-        let url = self.base.join("api/v1/cache/cargo/save")?;
-        let response = self
-            .http
-            .post(url)
-            .bearer_auth(self.token.expose())
-            .json(&body)
-            .send()
-            .await
-            .context("send")?;
-
-        match response.status() {
-            StatusCode::CREATED => Ok(()),
-            status => {
-                let url = response.url().to_string();
-                let request_id = request_id(&response);
-                let body = response.text().await.unwrap_or_default();
-                return Err(eyre!("unexpected status code: {status}"))
-                    .with_section(|| url.header("Url:"))
-                    .with_section(|| body.header("Body:"))
-                    .with_section(|| request_id.header("Request ID:"));
-            }
-        }
-    }
-
-    /// Restore cargo cache metadata.
-    #[instrument(skip(self))]
-    pub async fn cargo_cache_restore(
-        &self,
-        body: CargoRestoreRequest,
-    ) -> Result<Option<CargoRestoreResponse>> {
-        let url = self.base.join("api/v1/cache/cargo/restore")?;
-        let response = self
-            .http
-            .post(url)
-            .bearer_auth(self.token.expose())
-            .json(&body)
-            .send()
-            .await
-            .context("send")?;
-
-        match response.status() {
-            StatusCode::OK => {
-                let data = response
-                    .json::<CargoRestoreResponse>()
-                    .await
-                    .context("parse JSON response")?;
-                Ok(Some(data))
-            }
-            StatusCode::NOT_FOUND => Ok(None),
-            status => {
-                let url = response.url().to_string();
-                let request_id = request_id(&response);
-                let body = response.text().await.unwrap_or_default();
-                return Err(eyre!("unexpected status code: {status}"))
-                    .with_section(|| url.header("Url:"))
-                    .with_section(|| body.header("Body:"))
-                    .with_section(|| request_id.header("Request ID:"));
-            }
-        }
-    }
-
-    /// Restore multiple cargo cache entries in bulk.
-    ///
-    /// Note: The server supports up to 100,000 requests in a single bulk
-    /// operation. If you exceed this limit, the server will return a 400
-    /// Bad Request error.
-    #[instrument(skip(self, requests))]
-    pub async fn cargo_cache_restore_bulk(
-        &self,
-        requests: impl IntoIterator<Item = impl Into<CargoRestoreRequest>>,
-    ) -> Result<CargoBulkRestoreResponse> {
-        let url = self.base.join("api/v1/cache/cargo/bulk/restore")?;
-        let requests = requests.into_iter().map(Into::into).collect::<Vec<_>>();
-        let body = CargoBulkRestoreRequest::builder()
-            .requests(requests)
-            .build();
-
-        let response = self
-            .http
-            .post(url)
-            .bearer_auth(self.token.expose())
-            .json(&body)
-            .send()
-            .await
-            .context("send")?;
-
-        match response.status() {
-            StatusCode::OK => {
-                let data = response
-                    .json::<CargoBulkRestoreResponse>()
-                    .await
-                    .context("parse JSON response")?;
-                Ok(data)
-            }
-            status => {
-                let url = response.url().to_string();
-                let request_id = request_id(&response);
-                let body = response.text().await.unwrap_or_default();
-                Err(eyre!("unexpected status code: {status}"))
-                    .with_section(|| url.header("Url:"))
-                    .with_section(|| body.header("Body:"))
-                    .with_section(|| request_id.header("Request ID:"))
             }
         }
     }
