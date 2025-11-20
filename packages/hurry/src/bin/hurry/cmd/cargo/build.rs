@@ -146,7 +146,8 @@ pub async fn exec(options: Options) -> Result<()> {
 
     // Compute expected unit plans. Note that because we are not actually
     // running build scripts, these "unit plans" do not contain fully
-    // unambiguous cache key information (e.g. they do not provide build script outputs).
+    // unambiguous cache key information (e.g. they do not provide build script
+    // outputs).
     let units = workspace
         .units(&args)
         .await

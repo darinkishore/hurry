@@ -39,7 +39,7 @@ mod tests {
         let (_, key2) = test_blob(format!("{name}_dep_info").as_bytes());
         let (_, key3) = test_blob(format!("{name}_encoded_dep_info").as_bytes());
 
-        let cache_key = SavedUnitCacheKey::builder().unit(&unit_hash).build();
+        let cache_key = SavedUnitCacheKey::builder().unit_hash(&unit_hash).build();
 
         let unit = SavedUnit::LibraryCrate(
             LibraryFiles::builder()

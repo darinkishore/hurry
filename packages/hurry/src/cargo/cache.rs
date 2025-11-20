@@ -9,7 +9,6 @@ use uuid::Uuid;
 
 use crate::{
     cargo::{
-        BuildScriptCompilationUnitPlan, BuildScriptExecutionUnitPlan, LibraryCrateUnitPlan,
         QualifiedPath, UnitPlan, Workspace,
         cache::{
             build_script_compilation::BuildScriptCompiledFiles,

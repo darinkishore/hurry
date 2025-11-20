@@ -49,7 +49,10 @@ impl SavedUnitCacheKey {
     pub fn stable_hash(&self) -> String {
         // When we add new fields, this will show a compile time error; if you got here
         // due to a compilation error please handle the new field(s) appropriately.
-        let Self { unit_hash, generation } = self;
+        let Self {
+            unit_hash,
+            generation,
+        } = self;
         let mut hasher = blake3::Hasher::new();
         hasher.update(format!("{generation}").as_bytes());
         hasher.update(unit_hash.as_str().as_bytes());

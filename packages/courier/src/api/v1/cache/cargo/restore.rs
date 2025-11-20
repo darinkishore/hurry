@@ -76,7 +76,7 @@ mod tests {
         let (_, key2) = test_blob(format!("{name}_dep_info").as_bytes());
         let (_, key3) = test_blob(format!("{name}_encoded_dep_info").as_bytes());
 
-        let cache_key = SavedUnitCacheKey::builder().unit(&unit_hash).build();
+        let cache_key = SavedUnitCacheKey::builder().unit_hash(&unit_hash).build();
 
         let unit = SavedUnit::LibraryCrate(
             LibraryFiles::builder()
@@ -153,7 +153,7 @@ mod tests {
         let (server, auth, _tmp) = test_server(pool).await.context("create test server")?;
 
         let cache_key = SavedUnitCacheKey::builder()
-            .unit(SavedUnitHash::new("nonexistent"))
+            .unit_hash(SavedUnitHash::new("nonexistent"))
             .build();
         let restore_request = CargoRestoreRequest2::new([cache_key]);
 
@@ -219,7 +219,7 @@ mod tests {
 
         let (cache_key1, unit1) = test_saved_unit("serde", "v1");
         let cache_key2 = SavedUnitCacheKey::builder()
-            .unit(SavedUnitHash::new("nonexistent"))
+            .unit_hash(SavedUnitHash::new("nonexistent"))
             .build();
 
         let save_request = CargoSaveRequest2::new([CargoSaveUnitRequest::builder()
@@ -381,7 +381,7 @@ mod tests {
         let (server, _auth, _tmp) = test_server(pool).await.context("create test server")?;
 
         let cache_key = SavedUnitCacheKey::builder()
-            .unit(SavedUnitHash::new("test"))
+            .unit_hash(SavedUnitHash::new("test"))
             .build();
         let restore_request = CargoRestoreRequest2::new([cache_key]);
 
@@ -401,7 +401,7 @@ mod tests {
         let (server, _auth, _tmp) = test_server(pool).await.context("create test server")?;
 
         let cache_key = SavedUnitCacheKey::builder()
-            .unit(SavedUnitHash::new("test"))
+            .unit_hash(SavedUnitHash::new("test"))
             .build();
         let restore_request = CargoRestoreRequest2::new([cache_key]);
 
@@ -422,7 +422,7 @@ mod tests {
         let (server, auth, _tmp) = test_server(pool).await.context("create test server")?;
 
         let cache_key = SavedUnitCacheKey::builder()
-            .unit(SavedUnitHash::new("test"))
+            .unit_hash(SavedUnitHash::new("test"))
             .build();
         let restore_request = CargoRestoreRequest2::new([cache_key]);
 
