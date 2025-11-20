@@ -7,7 +7,7 @@ use tracing::{error, info};
 
 use crate::{auth::AuthenticatedToken, db::Postgres};
 
-#[tracing::instrument(skip(auth))]
+#[tracing::instrument(skip_all)]
 pub async fn handle(
     auth: AuthenticatedToken,
     Dep(db): Dep<Postgres>,

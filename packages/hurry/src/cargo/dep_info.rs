@@ -85,7 +85,7 @@ impl DepInfo {
     }
 
     /// Reconstruct the "dep-info" file in the context of the profile directory.
-    #[instrument(name = "DepInfo::reconstruct")]
+    #[instrument(name = "DepInfo::reconstruct", skip_all)]
     pub fn reconstruct(self, ws: &Workspace, target: &RustcTarget) -> Result<String> {
         self.0
             .into_iter()
@@ -185,7 +185,7 @@ impl DepInfoLine {
         })
     }
 
-    #[instrument(name = "DepInfoLine::reconstruct")]
+    #[instrument(name = "DepInfoLine::reconstruct", skip_all)]
     pub fn reconstruct(self, ws: &Workspace, target: &RustcTarget) -> Result<String> {
         Ok(match self {
             Self::Build(output, inputs) => {

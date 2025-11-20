@@ -130,7 +130,7 @@ impl Client {
     }
 
     /// Restore cargo cache metadata.
-    #[instrument(skip(self))]
+    #[instrument(skip_all)]
     pub async fn cargo_cache_restore2(
         &self,
         body: CargoRestoreRequest2,

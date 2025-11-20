@@ -1,6 +1,6 @@
 use color_eyre::{
     Result,
-    eyre::{OptionExt as _, bail},
+    eyre::{Context as _, OptionExt as _, bail},
 };
 use dashmap::DashSet;
 use derive_more::Debug;
@@ -51,7 +51,7 @@ impl Restored {
 struct FileRestoreKey {
     key: Key,
     #[debug(skip)]
-    write: Box<dyn FnOnce(Vec<u8>) -> BoxFuture<'static, Result<()>> + Send + Sync>,
+    write: Box<dyn FnOnce(&Vec<u8>) -> BoxFuture<'static, Result<()>> + Send + Sync>,
 }
 
 #[instrument(skip(units, progress))]
@@ -91,6 +91,8 @@ pub async fn restore_units(
             let restored = restored.clone();
             workers.spawn(restore_worker(rx, cas, progress, restored));
         }
+        // Dropping the `rx` causes it to close, so we cannot drop it until all
+        // workers have finished receiving files.
         (tx, workers)
     };
 
@@ -145,6 +147,7 @@ pub async fn restore_units(
                     files_to_restore.push(FileRestoreKey {
                         key: file.object_key.clone(),
                         write: Box::new(move |data| {
+                            let data = data.clone();
                             Box::pin(async move {
                                 let abs_path = path
                                     .reconstruct(&ws_clone, &target_arch)?
@@ -166,6 +169,7 @@ pub async fn restore_units(
                 files_to_restore.push(FileRestoreKey {
                     key: saved_library_files.dep_info_file.clone(),
                     write: Box::new(move |data| {
+                        let data = data.clone();
                         Box::pin(async move {
                             let dep_info: cargo::DepInfo = serde_json::from_slice(&data)?;
                             let reconstructed = dep_info
@@ -186,6 +190,7 @@ pub async fn restore_units(
                 files_to_restore.push(FileRestoreKey {
                     key: saved_library_files.encoded_dep_info_file.clone(),
                     write: Box::new(move |data| {
+                        let data = data.clone();
                         Box::pin(async move {
                             fs::write(
                                 &profile_dir_clone.join(&unit_plan_clone.encoded_dep_info_file()?),
@@ -221,6 +226,7 @@ pub async fn restore_units(
                 files_to_restore.push(FileRestoreKey {
                     key: build_script_compiled_files.compiled_program.clone(),
                     write: Box::new(move |data| {
+                        let data = data.clone();
                         Box::pin(async move {
                             let program_file =
                                 profile_dir_clone.join(unit_plan_clone.program_file()?);
@@ -243,6 +249,7 @@ pub async fn restore_units(
                 files_to_restore.push(FileRestoreKey {
                     key: build_script_compiled_files.dep_info_file.clone(),
                     write: Box::new(move |data| {
+                        let data = data.clone();
                         Box::pin(async move {
                             let dep_info: cargo::DepInfo = serde_json::from_slice(&data)?;
                             let reconstructed = dep_info
@@ -263,6 +270,7 @@ pub async fn restore_units(
                 files_to_restore.push(FileRestoreKey {
                     key: build_script_compiled_files.encoded_dep_info_file.clone(),
                     write: Box::new(move |data| {
+                        let data = data.clone();
                         Box::pin(async move {
                             fs::write(
                                 &profile_dir_clone.join(&unit_plan_clone.encoded_dep_info_file()?),
@@ -302,6 +310,7 @@ pub async fn restore_units(
                     files_to_restore.push(FileRestoreKey {
                         key: file.object_key.clone(),
                         write: Box::new(move |data| {
+                            let data = data.clone();
                             Box::pin(async move {
                                 let abs_path = path
                                     .reconstruct(&ws_clone, &target_arch)?
@@ -321,6 +330,7 @@ pub async fn restore_units(
                 files_to_restore.push(FileRestoreKey {
                     key: build_script_output_files.stdout.clone(),
                     write: Box::new(move |data| {
+                        let data = data.clone();
                         Box::pin(async move {
                             let stdout: cargo::BuildScriptOutput = serde_json::from_slice(&data)?;
                             let reconstructed =
@@ -341,6 +351,7 @@ pub async fn restore_units(
                 files_to_restore.push(FileRestoreKey {
                     key: build_script_output_files.stderr.clone(),
                     write: Box::new(move |data| {
+                        let data = data.clone();
                         Box::pin(async move {
                             fs::write(
                                 &profile_dir_clone.join(&unit_plan_clone.stderr_file()?),
@@ -375,19 +386,26 @@ pub async fn restore_units(
         progress.inc(1);
     }
 
+    debug!("start sending files to restore workers");
     for file in files_to_restore {
         tx.send_async(file).await?;
         progress.add_files(1);
     }
     drop(tx);
+    debug!("done sending files to restore workers");
 
+    debug!("start joining restore workers");
     while let Some(worker) = workers.join_next().await {
-        worker??;
+        worker
+            .context("could not join worker")?
+            .context("worker returned an error")?;
     }
+    debug!("done joining restore workers");
 
     Ok(restored)
 }
 
+#[instrument(skip_all)]
 async fn restore_worker(
     rx: flume::Receiver<FileRestoreKey>,
     cas: CourierCas,
@@ -397,66 +415,87 @@ async fn restore_worker(
     const BATCH_SIZE: usize = 50;
     let mut batch = Vec::new();
     while let Ok(file) = rx.recv_async().await {
-        trace!(?file, "worker got file");
+        debug!(?file, "worker got file");
 
         // Add the file to the batch.
         batch.push(file);
+        debug!(len = ?batch.len(), "batch length");
         // If the batch is not full, wait for the batch to fill.
         if batch.len() < BATCH_SIZE {
+            debug!("batch not full, waiting for more files");
             continue;
         }
+        debug!("batch full, restoring");
 
         // Restore batches once full.
         let batch_to_restore = std::mem::take(&mut batch);
         restore_batch(batch_to_restore, &cas, &progress, &restored).await?;
     }
+    debug!("worker rx closed");
 
     // Once the channel closes, there may still be a partially filled batch
     // remaining. Restore the remaining files in the batch.
     if !batch.is_empty() {
+        debug!(?batch, "restoring remaining batch");
         restore_batch(batch, &cas, &progress, &restored).await?;
+        debug!("done restoring remaining batch");
     }
 
     Ok(())
 }
 
+#[instrument(skip_all)]
 async fn restore_batch(
     batch: Vec<FileRestoreKey>,
     cas: &CourierCas,
     progress: &TransferBar,
     restored: &Restored,
 ) -> Result<()> {
+    debug!(?batch, "restoring batch");
+
     // Construct a map of object keys to file restore keys.
     let keys = batch
         .iter()
         .map(|file| file.key.clone())
         .collect::<Vec<_>>();
-    let mut key_to_file_restore = batch
-        .into_iter()
-        .map(|file| (file.key.clone(), file))
-        .collect::<HashMap<_, _>>();
+    // Note that you can have multiple files with the same key.
+    let mut key_to_files = HashMap::new();
+    for file in batch {
+        key_to_files
+            .entry(file.key.clone())
+            .or_insert(vec![])
+            .push(file);
+    }
 
     // For each streamed CAS key, restore the file to the local filesystem.
+    debug!(?keys, "start fetching files from CAS");
     let mut res = cas.get_bulk(keys).await?;
+    debug!("start streaming response from CAS");
     while let Some(result) = res.next().await {
         match result {
             Ok((key, data)) => {
-                let file = key_to_file_restore
+                debug!(?key, "CAS stream entry");
+                let files = key_to_files
                     .remove(&key)
                     .ok_or_eyre("unrecognized key from CAS bulk response")?;
-                restored.record_file(file.key);
+                for file in files {
+                    restored.record_file(file.key);
 
-                progress.add_files(1);
-                progress.add_bytes(data.len() as u64);
+                    progress.add_files(1);
+                    progress.add_bytes(data.len() as u64);
 
-                // Call the write callback to handle all file operations.
-                (file.write)(data).await?;
+                    // Call the write callback to handle all file operations.
+                    debug!(?key, "calling write callback");
+                    (file.write)(&data).await?;
+                    debug!(?key, "done calling write callback");
+                }
             }
             Err(error) => {
                 warn!(?error, "failed to fetch file from CAS");
             }
         }
     }
+    debug!("done streaming response from CAS");
 
     Ok(())
 }
