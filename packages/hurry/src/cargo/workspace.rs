@@ -1226,6 +1226,30 @@ impl TryFrom<LibraryCrateUnitPlan> for courier::LibraryCrateUnitPlan {
     }
 }
 
+impl TryFrom<BuildScriptCompilationUnitPlan> for courier::BuildScriptCompilationUnitPlan {
+    type Error = eyre::Report;
+
+    fn try_from(value: BuildScriptCompilationUnitPlan) -> Result<Self> {
+        Self::builder()
+            .info(value.info)
+            .src_path(serde_json::to_string(&value.src_path)?)
+            .build()
+            .pipe(Ok)
+    }
+}
+
+impl TryFrom<BuildScriptExecutionUnitPlan> for courier::BuildScriptExecutionUnitPlan {
+    type Error = eyre::Report;
+
+    fn try_from(value: BuildScriptExecutionUnitPlan) -> Result<Self> {
+        Self::builder()
+            .info(value.info)
+            .build_script_program_name(value.build_script_program_name)
+            .build()
+            .pipe(Ok)
+    }
+}
+
 #[derive(Debug, Clone, Eq, PartialEq, Hash, Serialize, Deserialize)]
 pub struct BuildScriptCompilationUnitPlan {
     pub info: UnitPlanInfo,

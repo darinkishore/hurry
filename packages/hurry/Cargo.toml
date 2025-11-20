@@ -27,7 +27,7 @@ fslock = { workspace = true }
 git-version = { workspace = true }
 homedir = { workspace = true }
 itertools = { workspace = true }
-serde = { workspace = true, features = ["derive"] }
+serde = { workspace = true, features = ["derive", "rc", "std"] }
 serde_json = { workspace = true }
 strum = { workspace = true, features = ["derive"] }
 subenum = { workspace = true }

@@ -18,7 +18,7 @@ use uuid::Uuid;
 
 use clients::Token;
 use hurry::{
-    cargo::{self, CargoBuildArguments, CargoCache, Profile, Workspace},
+    cargo::{self, CargoBuildArguments, CargoCache, Workspace},
     ci::is_ci,
     daemon::{CargoUploadStatus, CargoUploadStatusRequest, CargoUploadStatusResponse, DaemonPaths},
     progress::TransferBar,
@@ -143,15 +143,6 @@ pub async fn exec(options: Options) -> Result<()> {
     let workspace = Workspace::from_argv(&args)
         .await
         .context("opening workspace")?;
-    let profile = args.profile().map(Profile::from).unwrap_or(Profile::Debug);
-
-    // Compute artifact plan, which provides expected artifacts. Note that
-    // because we are not actually running build scripts, these "expected
-    // artifacts" do not contain fully unambiguous cache key information.
-    let artifact_plan = workspace
-        .artifact_plan(&profile, &args)
-        .await
-        .context("calculating expected artifacts")?;
 
     // Compute expected unit plans. Note that because we are not actually
     // running build scripts, these "unit plans" do not contain fully
@@ -315,8 +306,7 @@ async fn wait_for_upload(request_id: Uuid, progress: &TransferBar) -> Result<()>
                         .saturating_sub(last_uploaded_artifacts),
                 );
                 last_uploaded_artifacts = save_progress.uploaded_units;
-                progress
-                    .dec_length(last_total_artifacts.saturating_sub(save_progress.total_units));
+                progress.dec_length(last_total_artifacts.saturating_sub(save_progress.total_units));
                 last_total_artifacts = save_progress.total_units;
             }
         }

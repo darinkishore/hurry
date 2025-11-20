@@ -1,32 +1,17 @@
-use std::{collections::HashSet, io::Write, time::UNIX_EPOCH};
-
-use color_eyre::{
-    Result,
-    eyre::{Context as _, OptionExt as _, bail},
-};
-use futures::{TryStreamExt as _, stream};
-use itertools::Itertools as _;
+use color_eyre::Result;
+use futures::stream;
 use serde::{Deserialize, Serialize};
-use tap::Pipe as _;
-use tracing::{debug, instrument, trace, warn};
+use tracing::{instrument, trace};
 
 use crate::{
-    cargo::{
-        self, BuildScriptOutput, BuiltArtifact, DepInfo, QualifiedPath, Restored, RootOutput,
-        RustcTarget, UnitPlan, Workspace, cache,
-    },
+    cargo::{Restored, UnitPlan, Workspace, cache},
     cas::CourierCas,
-    fs,
-    path::{AbsFilePath, TryJoinWith as _},
 };
 use clients::{
     Courier,
     courier::v1::{
         self as courier, Key,
-        cache::{
-            ArtifactFile, CargoSaveRequest, CargoSaveRequest2, CargoSaveUnitRequest,
-            SavedUnitCacheKey,
-        },
+        cache::{CargoSaveRequest2, CargoSaveUnitRequest, SavedUnitCacheKey},
     },
 };
 
@@ -39,7 +24,7 @@ pub struct SaveProgress {
 }
 
 #[instrument(skip_all)]
-pub async fn save_artifacts(
+pub async fn save_units(
     courier: &Courier,
     cas: &CourierCas,
     ws: Workspace,
@@ -133,8 +118,110 @@ pub async fn save_artifacts(
 
                 save_requests.push(save_request);
             }
-            UnitPlan::BuildScriptCompilation(plan) => todo!(),
-            UnitPlan::BuildScriptExecution(plan) => todo!(),
+            UnitPlan::BuildScriptCompilation(plan) => {
+                // Read unit files.
+                let files = cache::BuildScriptCompiledFiles::read(&ws, &plan).await?;
+
+                // Prepare CAS objects.
+                let mut cas_uploads = Vec::new();
+
+                progress.uploaded_files += 1;
+                progress.uploaded_bytes += files.compiled_program.len() as u64;
+                let compiled_program = Key::from_buffer(&files.compiled_program);
+                cas_uploads.push((compiled_program.clone(), files.compiled_program));
+
+                let dep_info_file_contents = serde_json::to_vec(&files.dep_info_file)?;
+                progress.uploaded_files += 1;
+                progress.uploaded_bytes += dep_info_file_contents.len() as u64;
+                let dep_info_file = Key::from_buffer(&dep_info_file_contents);
+                cas_uploads.push((dep_info_file.clone(), dep_info_file_contents));
+
+                progress.uploaded_files += 1;
+                progress.uploaded_bytes += files.encoded_dep_info_file.len() as u64;
+                let encoded_dep_info_file = Key::from_buffer(&files.encoded_dep_info_file);
+                cas_uploads.push((encoded_dep_info_file.clone(), files.encoded_dep_info_file));
+
+                // Save CAS objects.
+                cas.store_bulk(stream::iter(cas_uploads)).await?;
+
+                // Prepare save request.
+                let fingerprint = serde_json::to_string(&files.fingerprint)?;
+                let save_request = CargoSaveUnitRequest::builder()
+                    .key(
+                        SavedUnitCacheKey::builder()
+                            .unit_hash(plan.info.clone().unit_hash)
+                            .build(),
+                    )
+                    .unit(courier::SavedUnit::BuildScriptCompilation(
+                        courier::BuildScriptCompiledFiles::builder()
+                            .compiled_program(compiled_program)
+                            .dep_info_file(dep_info_file)
+                            .fingerprint(fingerprint)
+                            .encoded_dep_info_file(encoded_dep_info_file)
+                            .build(),
+                        plan.try_into()?,
+                    ))
+                    .build();
+
+                save_requests.push(save_request);
+            }
+            UnitPlan::BuildScriptExecution(plan) => {
+                // Read unit files.
+                let files = cache::BuildScriptOutputFiles::read(&ws, &plan).await?;
+
+                // Prepare CAS objects.
+                let mut cas_uploads = Vec::new();
+                let mut out_dir_files = Vec::new();
+                for out_dir_file in files.out_dir_files {
+                    progress.uploaded_files += 1;
+                    progress.uploaded_bytes += out_dir_file.contents.len() as u64;
+
+                    let object_key = Key::from_buffer(&out_dir_file.contents);
+                    cas_uploads.push((object_key.clone(), out_dir_file.contents));
+                    out_dir_files.push(
+                        courier::SavedFile::builder()
+                            .object_key(object_key)
+                            .executable(out_dir_file.executable)
+                            .path(serde_json::to_string(&out_dir_file.path)?)
+                            .build(),
+                    );
+                }
+
+                let stdout_contents = serde_json::to_vec(&files.stdout)?;
+                progress.uploaded_files += 1;
+                progress.uploaded_bytes += stdout_contents.len() as u64;
+                let stdout = Key::from_buffer(&stdout_contents);
+                cas_uploads.push((stdout.clone(), stdout_contents));
+
+                progress.uploaded_files += 1;
+                progress.uploaded_bytes += files.stderr.len() as u64;
+                let stderr = Key::from_buffer(&files.stderr);
+                cas_uploads.push((stderr.clone(), files.stderr));
+
+                // Save CAS objects.
+                cas.store_bulk(stream::iter(cas_uploads)).await?;
+
+                // Prepare save request.
+                let fingerprint = serde_json::to_string(&files.fingerprint)?;
+                let save_request = CargoSaveUnitRequest::builder()
+                    .key(
+                        SavedUnitCacheKey::builder()
+                            .unit_hash(plan.info.clone().unit_hash)
+                            .build(),
+                    )
+                    .unit(courier::SavedUnit::BuildScriptExecution(
+                        courier::BuildScriptOutputFiles::builder()
+                            .out_dir_files(out_dir_files)
+                            .stdout(stdout)
+                            .stderr(stderr)
+                            .fingerprint(fingerprint)
+                            .build(),
+                        plan.try_into()?,
+                    ))
+                    .build();
+
+                save_requests.push(save_request);
+            }
         }
         progress.uploaded_units += 1;
         on_progress(&progress);

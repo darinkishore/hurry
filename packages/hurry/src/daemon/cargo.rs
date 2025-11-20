@@ -14,7 +14,7 @@ use url::Url;
 use uuid::Uuid;
 
 use crate::{
-    cargo::{Restored, SaveProgress, UnitPlan, Workspace, save_artifacts},
+    cargo::{Restored, SaveProgress, UnitPlan, Workspace, save_units},
     cas::CourierCas,
 };
 use clients::{Courier, Token};
@@ -73,7 +73,7 @@ async fn upload(
     tokio::spawn(async move {
         let courier = Courier::new(req.courier_url, req.courier_token)?;
         let cas = CourierCas::new(courier.clone());
-        let upload = save_artifacts(&courier, &cas, req.ws, req.units, req.skip, |progress| {
+        let upload = save_units(&courier, &cas, req.ws, req.units, req.skip, |progress| {
             state
                 .uploads
                 .insert(request_id, CargoUploadStatus::InProgress(progress.clone()));

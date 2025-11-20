@@ -181,6 +181,10 @@ impl CargoRestoreResponse2 {
     pub fn get(&self, key: &SavedUnitCacheKey) -> Option<&SavedUnit> {
         self.0.get(key)
     }
+
+    pub fn take(&mut self, key: &SavedUnitCacheKey) -> Option<SavedUnit> {
+        self.0.remove(key)
+    }
 }
 
 impl IntoIterator for CargoRestoreResponse2 {

@@ -20,7 +20,7 @@ use crate::{
     daemon::{CargoUploadRequest, DaemonPaths},
     progress::TransferBar,
 };
-use clients::{Courier, Token, courier::v1 as courier};
+use clients::{Courier, Token};
 
 mod build_script_compilation;
 mod build_script_execution;
@@ -28,8 +28,8 @@ mod library_crate;
 mod restore;
 mod save;
 
-pub use restore::{Restored, restore_artifacts};
-pub use save::{SaveProgress, save_artifacts};
+pub use restore::{Restored, restore_units};
+pub use save::{SaveProgress, save_units};
 
 #[derive(Debug, Clone)]
 pub struct CargoCache {
@@ -132,7 +132,7 @@ impl CargoCache {
 
     #[instrument(name = "CargoCache::restore", skip_all)]
     pub async fn restore(&self, units: &Vec<UnitPlan>, progress: &TransferBar) -> Result<Restored> {
-        restore_artifacts(&self.courier, &self.cas, &self.ws, units, progress).await
+        restore_units(&self.courier, &self.cas, &self.ws, units, progress).await
     }
 }
 
@@ -141,11 +141,4 @@ pub struct SavedFile {
     path: QualifiedPath,
     contents: Vec<u8>,
     executable: bool,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub enum SavedUnit {
-    LibraryCrate(LibraryFiles, LibraryCrateUnitPlan),
-    BuildScriptCompilation(BuildScriptCompiledFiles, BuildScriptCompilationUnitPlan),
-    BuildScriptExecution(BuildScriptOutputFiles, BuildScriptExecutionUnitPlan),
 }

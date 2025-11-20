@@ -20,10 +20,10 @@ use crate::{
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct BuildScriptOutputFiles {
-    out_dir_files: Vec<SavedFile>,
-    stdout: BuildScriptOutput,
-    stderr: Vec<u8>,
-    fingerprint: Fingerprint,
+    pub out_dir_files: Vec<SavedFile>,
+    pub stdout: BuildScriptOutput,
+    pub stderr: Vec<u8>,
+    pub fingerprint: Fingerprint,
 }
 
 impl BuildScriptOutputFiles {
