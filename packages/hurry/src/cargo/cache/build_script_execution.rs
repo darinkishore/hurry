@@ -122,8 +122,19 @@ impl BuildScriptOutputFiles {
         .await?;
 
         // Reconstruct and restore fingerprint.
-        let mut saved_fingerprint = self.fingerprint;
-        let old_fingerprint_hash = saved_fingerprint.hash_u64();
+        Self::restore_fingerprint(ws, dep_fingerprints, self.fingerprint, unit_plan).await?;
+
+        Ok(())
+    }
+
+    pub async fn restore_fingerprint(
+        ws: &Workspace,
+        dep_fingerprints: &mut HashMap<u64, Arc<Fingerprint>>,
+        mut fingerprint: Fingerprint,
+        unit_plan: &BuildScriptExecutionUnitPlan,
+    ) -> Result<()> {
+        let profile_dir = ws.unit_profile_dir(&unit_plan.info);
+        let old_fingerprint_hash = fingerprint.hash_u64();
 
         // Rewrite the `deps` field. Note that we never need to rewrite
         // the `path` field for build script execution units, since it's
@@ -144,7 +155,7 @@ impl BuildScriptOutputFiles {
         //
         // [^1]: https://github.com/attunehq/cargo/blob/21f1bfe23aa3fafd6205b8e3368a499466336bb9/src/cargo/core/compiler/fingerprint/mod.rs#L1696
         debug!("rewrite fingerprint deps: start");
-        for dep in saved_fingerprint.deps.iter_mut() {
+        for dep in fingerprint.deps.iter_mut() {
             debug!(?dep, "rewriting fingerprint dep");
             let old_dep_fingerprint = dep.fingerprint.hash_u64();
             dep.fingerprint = dep_fingerprints
@@ -160,9 +171,9 @@ impl BuildScriptOutputFiles {
         debug!("rewrite fingerprint deps: done");
 
         // Clear and recalculate fingerprint hash.
-        saved_fingerprint.clear_memoized();
-        let fingerprint_hash = saved_fingerprint.fingerprint_hash();
-        debug!(old = ?old_fingerprint_hash, new = ?saved_fingerprint.hash_u64(), "rewritten fingerprint hash");
+        fingerprint.clear_memoized();
+        let fingerprint_hash = fingerprint.fingerprint_hash();
+        debug!(old = ?old_fingerprint_hash, new = ?fingerprint.hash_u64(), "rewritten fingerprint hash");
 
         // Finally, write the reconstructed fingerprint.
         fs::write(
@@ -172,12 +183,12 @@ impl BuildScriptOutputFiles {
         .await?;
         fs::write(
             &profile_dir.join(&unit_plan.fingerprint_json_file()?),
-            serde_json::to_vec(&saved_fingerprint)?,
+            serde_json::to_vec(&fingerprint)?,
         )
         .await?;
 
         // Save unit fingerprint (for future dependents).
-        dep_fingerprints.insert(old_fingerprint_hash, Arc::new(saved_fingerprint));
+        dep_fingerprints.insert(old_fingerprint_hash, Arc::new(fingerprint));
 
         Ok(())
     }

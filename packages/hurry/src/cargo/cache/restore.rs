@@ -4,11 +4,13 @@ use color_eyre::{
 };
 use dashmap::DashSet;
 use derive_more::Debug;
-use futures::StreamExt;
+use futures::{StreamExt, future::BoxFuture};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use tokio::task::JoinSet;
 use tracing::{debug, instrument, trace, warn};
+
+use tap::Pipe as _;
 
 use crate::{
     cargo::{self, QualifiedPath, UnitPlan, Workspace, cache, workspace::UnitHash},
@@ -45,11 +47,11 @@ impl Restored {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 struct FileRestoreKey {
-    path: AbsFilePath,
     key: Key,
-    transform: fn(Vec<u8>) -> Vec<u8>,
+    #[debug(skip)]
+    write: Box<dyn FnOnce(Vec<u8>) -> BoxFuture<'static, Result<()>> + Send + Sync>,
 }
 
 #[instrument(skip(units, progress))]
@@ -136,45 +138,228 @@ pub async fn restore_units(
                 // Queue the output files.
                 for file in saved_library_files.output_files {
                     let path: QualifiedPath = serde_json::from_str(file.path.as_str())?;
+                    let ws_clone = ws.clone();
+                    let target_arch = unit_plan.info.target_arch.clone();
+                    let executable = file.executable;
+
                     files_to_restore.push(FileRestoreKey {
-                        path: path
-                            .reconstruct(ws, &unit_plan.info.target_arch)?
-                            .try_into()?,
                         key: file.object_key.clone(),
-                        transform: |data| data,
+                        write: Box::new(move |data| {
+                            Box::pin(async move {
+                                let abs_path = path
+                                    .reconstruct(&ws_clone, &target_arch)?
+                                    .pipe(AbsFilePath::try_from)?;
+                                fs::write(&abs_path, data).await?;
+                                fs::set_executable(&abs_path, executable).await?;
+                                Ok(())
+                            })
+                        }),
                     });
                 }
 
                 let profile_dir = ws.unit_profile_dir(&unit_plan.info);
 
-                // Queue the dep-info file.
+                // Queue the dep-info file with reconstruction.
+                let ws_clone = ws.clone();
+                let unit_plan_clone = unit_plan.clone();
+                let profile_dir_clone = profile_dir.clone();
                 files_to_restore.push(FileRestoreKey {
-                    path: profile_dir.join(&unit_plan.dep_info_file()?),
                     key: saved_library_files.dep_info_file.clone(),
-                    transform: |data| data,
+                    write: Box::new(move |data| {
+                        Box::pin(async move {
+                            let dep_info: cargo::DepInfo = serde_json::from_slice(&data)?;
+                            let reconstructed = dep_info
+                                .reconstruct(&ws_clone, &unit_plan_clone.info.target_arch)?;
+                            fs::write(
+                                &profile_dir_clone.join(&unit_plan_clone.dep_info_file()?),
+                                reconstructed,
+                            )
+                            .await?;
+                            Ok(())
+                        })
+                    }),
                 });
 
-                // Queue the encoded dep-info file.
+                // Queue the encoded dep-info file (no transformation).
+                let unit_plan_clone = unit_plan.clone();
+                let profile_dir_clone = profile_dir.clone();
                 files_to_restore.push(FileRestoreKey {
-                    path: profile_dir.join(&unit_plan.encoded_dep_info_file()?),
                     key: saved_library_files.encoded_dep_info_file.clone(),
-                    transform: |data| data,
+                    write: Box::new(move |data| {
+                        Box::pin(async move {
+                            fs::write(
+                                &profile_dir_clone.join(&unit_plan_clone.encoded_dep_info_file()?),
+                                data,
+                            )
+                            .await?;
+                            Ok(())
+                        })
+                    }),
                 });
             }
             (
-                SavedUnit::BuildScriptCompilation(
-                    build_script_compiled_files,
-                    build_script_compilation_unit_plan,
-                ),
+                SavedUnit::BuildScriptCompilation(build_script_compiled_files, _),
                 UnitPlan::BuildScriptCompilation(unit_plan),
-            ) => todo!(),
+            ) => {
+                // Restore the fingerprint directly, because fingerprint
+                // rewriting needs to occur in dependency order.
+                let fingerprint: cargo::Fingerprint =
+                    serde_json::from_str(build_script_compiled_files.fingerprint.as_str())?;
+                cache::BuildScriptCompiledFiles::restore_fingerprint(
+                    ws,
+                    &mut dep_fingerprints,
+                    fingerprint,
+                    unit_plan,
+                )
+                .await?;
+
+                let profile_dir = ws.unit_profile_dir(&unit_plan.info);
+
+                // Queue compiled program with hard link creation.
+                let unit_plan_clone = unit_plan.clone();
+                let profile_dir_clone = profile_dir.clone();
+                files_to_restore.push(FileRestoreKey {
+                    key: build_script_compiled_files.compiled_program.clone(),
+                    write: Box::new(move |data| {
+                        Box::pin(async move {
+                            let program_file =
+                                profile_dir_clone.join(unit_plan_clone.program_file()?);
+                            fs::write(&program_file, data).await?;
+                            fs::set_executable(&program_file, true).await?;
+                            fs::hard_link(
+                                &program_file,
+                                &profile_dir_clone.join(unit_plan_clone.linked_program_file()?),
+                            )
+                            .await?;
+                            Ok(())
+                        })
+                    }),
+                });
+
+                // Queue dep-info file with reconstruction.
+                let ws_clone = ws.clone();
+                let unit_plan_clone = unit_plan.clone();
+                let profile_dir_clone = profile_dir.clone();
+                files_to_restore.push(FileRestoreKey {
+                    key: build_script_compiled_files.dep_info_file.clone(),
+                    write: Box::new(move |data| {
+                        Box::pin(async move {
+                            let dep_info: cargo::DepInfo = serde_json::from_slice(&data)?;
+                            let reconstructed = dep_info
+                                .reconstruct(&ws_clone, &unit_plan_clone.info.target_arch)?;
+                            fs::write(
+                                &profile_dir_clone.join(&unit_plan_clone.dep_info_file()?),
+                                reconstructed,
+                            )
+                            .await?;
+                            Ok(())
+                        })
+                    }),
+                });
+
+                // Queue encoded dep-info file (no transformation).
+                let unit_plan_clone = unit_plan.clone();
+                let profile_dir_clone = profile_dir.clone();
+                files_to_restore.push(FileRestoreKey {
+                    key: build_script_compiled_files.encoded_dep_info_file.clone(),
+                    write: Box::new(move |data| {
+                        Box::pin(async move {
+                            fs::write(
+                                &profile_dir_clone.join(&unit_plan_clone.encoded_dep_info_file()?),
+                                data,
+                            )
+                            .await?;
+                            Ok(())
+                        })
+                    }),
+                });
+            }
             (
-                SavedUnit::BuildScriptExecution(
-                    build_script_output_files,
-                    build_script_execution_unit_plan,
-                ),
+                SavedUnit::BuildScriptExecution(build_script_output_files, _),
                 UnitPlan::BuildScriptExecution(unit_plan),
-            ) => todo!(),
+            ) => {
+                // Restore the fingerprint directly, because fingerprint
+                // rewriting needs to occur in dependency order.
+                let fingerprint: cargo::Fingerprint =
+                    serde_json::from_str(build_script_output_files.fingerprint.as_str())?;
+                cache::BuildScriptOutputFiles::restore_fingerprint(
+                    ws,
+                    &mut dep_fingerprints,
+                    fingerprint,
+                    unit_plan,
+                )
+                .await?;
+
+                let profile_dir = ws.unit_profile_dir(&unit_plan.info);
+
+                // Queue all OUT_DIR files with executable flag handling.
+                for file in build_script_output_files.out_dir_files {
+                    let path: QualifiedPath = serde_json::from_str(file.path.as_str())?;
+                    let ws_clone = ws.clone();
+                    let target_arch = unit_plan.info.target_arch.clone();
+                    let executable = file.executable;
+
+                    files_to_restore.push(FileRestoreKey {
+                        key: file.object_key.clone(),
+                        write: Box::new(move |data| {
+                            Box::pin(async move {
+                                let abs_path = path
+                                    .reconstruct(&ws_clone, &target_arch)?
+                                    .pipe(AbsFilePath::try_from)?;
+                                fs::write(&abs_path, data).await?;
+                                fs::set_executable(&abs_path, executable).await?;
+                                Ok(())
+                            })
+                        }),
+                    });
+                }
+
+                // Queue stdout with BuildScriptOutput reconstruction.
+                let ws_clone = ws.clone();
+                let unit_plan_clone = unit_plan.clone();
+                let profile_dir_clone = profile_dir.clone();
+                files_to_restore.push(FileRestoreKey {
+                    key: build_script_output_files.stdout.clone(),
+                    write: Box::new(move |data| {
+                        Box::pin(async move {
+                            let stdout: cargo::BuildScriptOutput = serde_json::from_slice(&data)?;
+                            let reconstructed =
+                                stdout.reconstruct(&ws_clone, &unit_plan_clone.info.target_arch)?;
+                            fs::write(
+                                &profile_dir_clone.join(&unit_plan_clone.stdout_file()?),
+                                reconstructed,
+                            )
+                            .await?;
+                            Ok(())
+                        })
+                    }),
+                });
+
+                // Queue stderr (no transformation).
+                let unit_plan_clone = unit_plan.clone();
+                let profile_dir_clone = profile_dir.clone();
+                files_to_restore.push(FileRestoreKey {
+                    key: build_script_output_files.stderr.clone(),
+                    write: Box::new(move |data| {
+                        Box::pin(async move {
+                            fs::write(
+                                &profile_dir_clone.join(&unit_plan_clone.stderr_file()?),
+                                data,
+                            )
+                            .await?;
+                            Ok(())
+                        })
+                    }),
+                });
+
+                // Generate root-output file (not from CAS - synthesized from unit_plan).
+                let root_output_path = profile_dir.join(&unit_plan.root_output_file()?);
+                fs::write(
+                    &root_output_path,
+                    unit_plan.out_dir()?.as_os_str().as_encoded_bytes(),
+                )
+                .await?;
+            }
             _ => bail!("unit type mismatch"),
         }
 
@@ -222,14 +407,15 @@ async fn restore_worker(
         }
 
         // Restore batches once full.
-        restore_batch(batch.clone(), &cas, &progress, &restored).await?;
-
-        // Clear the restored batch.
-        batch.clear();
+        let batch_to_restore = std::mem::take(&mut batch);
+        restore_batch(batch_to_restore, &cas, &progress, &restored).await?;
     }
 
     // Once the channel closes, there may still be a partially filled batch
     // remaining. Restore the remaining files in the batch.
+    if !batch.is_empty() {
+        restore_batch(batch, &cas, &progress, &restored).await?;
+    }
 
     Ok(())
 }
@@ -241,14 +427,17 @@ async fn restore_batch(
     restored: &Restored,
 ) -> Result<()> {
     // Construct a map of object keys to file restore keys.
+    let keys = batch
+        .iter()
+        .map(|file| file.key.clone())
+        .collect::<Vec<_>>();
     let mut key_to_file_restore = batch
-        .clone()
         .into_iter()
         .map(|file| (file.key.clone(), file))
         .collect::<HashMap<_, _>>();
 
     // For each streamed CAS key, restore the file to the local filesystem.
-    let mut res = cas.get_bulk(batch.into_iter().map(|file| file.key)).await?;
+    let mut res = cas.get_bulk(keys).await?;
     while let Some(result) = res.next().await {
         match result {
             Ok((key, data)) => {
@@ -259,8 +448,9 @@ async fn restore_batch(
 
                 progress.add_files(1);
                 progress.add_bytes(data.len() as u64);
-                let data = (file.transform)(data);
-                fs::write(&file.path, data).await?;
+
+                // Call the write callback to handle all file operations.
+                (file.write)(data).await?;
             }
             Err(error) => {
                 warn!(?error, "failed to fetch file from CAS");
