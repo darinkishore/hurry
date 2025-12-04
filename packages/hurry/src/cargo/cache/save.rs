@@ -41,15 +41,11 @@ pub async fn save_units(
         uploaded_bytes: 0,
     };
 
-    // TODO: Batch units together up to around 10MB in file size for optimal
+    // TODO: This algorithm currently uploads units one at a time. Instead, we
+    // should batch units together up to around 10MB in file size for optimal
     // upload speed. One way we could do this is have units present their
     // CAS-able contents, batch those contents up, and then issue save requests
     // for batches of units as their CAS contents are finished uploading.
-
-    // This algorithm currently uploads units one at a time, and only skips uploads
-    // at the unit level (not at the file level).
-    //
-    // TODO: Skip uploads at the file object level.
     let mut save_requests = Vec::new();
     for unit in units {
         if skip.units.contains(&unit.info().unit_hash) {
@@ -58,6 +54,8 @@ pub async fn save_units(
             on_progress(&progress);
             continue;
         }
+
+        let unit_arch = unit.info().target_arch.as_str().unwrap_or(&ws.host_arch);
 
         // Upload unit to CAS and cache.
         match unit {
@@ -70,6 +68,11 @@ pub async fn save_units(
 
                 let mut output_files = Vec::new();
                 for output_file in files.output_files {
+                    // TODO: For output files that are `.so` shared objects
+                    // (e.g. from proc macros or cdylib unit kinds) compiled
+                    // against glibc, we need to know the glibc version of the
+                    // imported symbols in the object file.
+
                     let object_key = Key::from_buffer(&output_file.contents);
                     output_files.push(
                         courier::SavedFile::builder()
@@ -134,6 +137,9 @@ pub async fn save_units(
                 // Prepare CAS objects.
                 let mut cas_uploads = Vec::new();
 
+                // TODO: For compiled build script programs, we need to know the
+                // glibc version of the symbols in the program if we are
+                // compiling against glibc.
                 let compiled_program = Key::from_buffer(&files.compiled_program);
                 if !skip.files.contains(&compiled_program) {
                     progress.uploaded_files += 1;

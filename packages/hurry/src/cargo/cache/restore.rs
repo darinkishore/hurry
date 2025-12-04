@@ -1,3 +1,9 @@
+use std::{
+    collections::{HashMap, HashSet},
+    sync::Arc,
+    time::{Duration, SystemTime},
+};
+
 use color_eyre::{
     Result,
     eyre::{Context as _, OptionExt as _, bail},
@@ -6,16 +12,11 @@ use dashmap::{DashMap, DashSet};
 use derive_more::Debug;
 use futures::{StreamExt, future::BoxFuture};
 use serde::{Deserialize, Serialize};
-use std::{
-    collections::{HashMap, HashSet},
-    sync::Arc,
-    time::{Duration, SystemTime},
-};
 use tokio::task::JoinSet;
 use tracing::{Instrument, debug, instrument, trace, warn};
 
 use crate::{
-    cargo::{self, QualifiedPath, UnitHash, UnitPlan, Workspace},
+    cargo::{self, QualifiedPath, UnitHash, UnitPlan, Workspace, host_glibc_version},
     cas::CourierCas,
     fs,
     path::JoinWith as _,
@@ -111,6 +112,10 @@ pub async fn restore_units(
             restored.units.insert(info.unit_hash.clone());
         }
     }
+
+    // TODO: If this build is against glibc, we need to know the glibc symbol
+    // version so we don't restore objects that link to missing symbols.
+    let host_glibc_symbol_version = host_glibc_version()?;
 
     // Load unit information from remote cache. Note that this does NOT download
     // the actual files, which are loaded as CAS keys.

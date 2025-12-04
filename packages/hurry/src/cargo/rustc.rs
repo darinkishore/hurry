@@ -1,17 +1,19 @@
-use std::{fmt::Debug, str::FromStr};
+use std::{
+    fmt::{Debug, Display},
+    str::FromStr,
+};
 
 use color_eyre::{
-    Report, Result, Section, SectionExt,
-    eyre::{Context, eyre},
+    Report, Result,
+    eyre::{self, Context, OptionExt as _},
 };
 use derive_more::Display;
 use enum_assoc::Assoc;
 use itertools::PeekingNext;
 use parse_display::{Display as ParseDisplay, FromStr as ParseFromStr};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
-use tracing::{instrument, trace};
-
-use crate::{cargo::CargoBuildArguments, path::AbsDirPath};
+use tap::Pipe as _;
+use tracing::trace;
 
 /// These variants correspond to Cargo's internal `CompileKind`[^1].
 ///
@@ -25,14 +27,14 @@ pub enum RustcTarget {
     /// the specific target architecture. Note that this causes Cargo to run in
     /// cross-compilation mode even if the specified target architecture is the
     /// same as the host architecture.
-    Specified(String),
+    Specified(RustcTargetPlatform),
 }
 
 impl RustcTarget {
-    fn as_str(&self) -> Option<&str> {
+    pub fn as_str(&self) -> Option<&str> {
         match self {
             RustcTarget::ImplicitHost => None,
-            RustcTarget::Specified(target) => Some(target),
+            RustcTarget::Specified(target) => Some(target.as_str()),
         }
     }
 }
@@ -41,18 +43,7 @@ impl From<RustcTarget> for Option<String> {
     fn from(value: RustcTarget) -> Self {
         match value {
             RustcTarget::ImplicitHost => None,
-            RustcTarget::Specified(target) => Some(target),
-        }
-    }
-}
-
-// TODO: Maybe get rid of this once we port over all the logic? After all, we
-// should really only be constructing these from explicit argv parsing.
-impl From<Option<String>> for RustcTarget {
-    fn from(value: Option<String>) -> Self {
-        match value {
-            Some(target) => RustcTarget::Specified(target),
-            None => RustcTarget::ImplicitHost,
+            RustcTarget::Specified(target) => Some(target.as_str().to_string()),
         }
     }
 }
@@ -72,81 +63,114 @@ impl<'de> Deserialize<'de> for RustcTarget {
         D: Deserializer<'de>,
     {
         Ok(match Option::<String>::deserialize(deserializer)? {
-            Some(target) => RustcTarget::Specified(target),
+            Some(target) => RustcTargetPlatform::try_from_str(&target)
+                .unwrap_or(RustcTargetPlatform::Unsupported(target))
+                .pipe(RustcTarget::Specified),
             None => RustcTarget::ImplicitHost,
         })
     }
 }
 
-/// Rust compiler metadata for cache key generation.
+/// These variants are parsed Rust "target triples", and their associated
+/// properties (e.g. whether they compile against glibc).
 ///
-/// Contains platform-specific compiler information needed to generate cache
-/// keys that are valid only for the current compilation target. This ensures
-/// cached artifacts are not incorrectly shared between different platforms or
-/// compiler configurations.
+/// For a full list of target triples, see the rustc book[^1].
 ///
-/// Currently only captures the LLVM target triple, but could be extended to
-/// include compiler version, feature flags, or other compilation options that
-/// affect output compatibility.
-//
-// TODO: Support users cross compiling; probably need to parse argv?
-//
-// TODO: Determine minimum compiler version.
-//
-// TODO: Is there a better way to get this?
-//
-// TODO: Add output from `rustc -vV`, which is what Cargo invokes? How does
-// Cargo use this information?
-#[derive(Clone, Eq, PartialEq, Hash, Debug, Deserialize)]
-pub struct RustcMetadata {
-    /// The host target triple.
-    #[serde(rename = "llvm-target")]
-    pub host_target: String,
+/// [^1]: https://doc.rust-lang.org/rustc/platform-support.html
+#[derive(Debug, Clone, Assoc, Eq, PartialEq, Hash)]
+#[func(pub fn as_str(&self) -> &str)]
+#[func(pub fn try_from_str(s: &str) -> Option<Self>)]
+#[func(pub fn supported(&self) -> bool)]
+#[func(pub fn uses_glibc(&self) -> bool)]
+pub enum RustcTargetPlatform {
+    // These are all the Tier 1 target platforms, which are the ones we support.
+    #[assoc(as_str = "aarch64-apple-darwin")]
+    #[assoc(try_from_str = "aarch64-apple-darwin")]
+    #[assoc(supported = true)]
+    #[assoc(uses_glibc = false)]
+    Arm64Darwin,
+    #[assoc(as_str = "aarch64-pc-windows-msvc")]
+    #[assoc(try_from_str = "aarch64-pc-windows-msvc")]
+    #[assoc(supported = true)]
+    #[assoc(uses_glibc = false)]
+    Arm64WindowsMSVC,
+    #[assoc(as_str = "aarch64-unknown-linux-gnu")]
+    #[assoc(try_from_str = "aarch64-unknown-linux-gnu")]
+    #[assoc(supported = true)]
+    #[assoc(uses_glibc = true)]
+    Arm64LinuxGNU,
+    #[assoc(as_str = "i686-pc-windows-msvc")]
+    #[assoc(try_from_str = "i686-pc-windows-msvc")]
+    #[assoc(supported = true)]
+    #[assoc(uses_glibc = false)]
+    I686WindowsMSVC,
+    #[assoc(as_str = "i686-unknown-linux-gnu")]
+    #[assoc(try_from_str = "i686-unknown-linux-gnu")]
+    #[assoc(supported = true)]
+    #[assoc(uses_glibc = true)]
+    I686LinuxGNU,
+    #[assoc(as_str = "x86_64-pc-windows-gnu")]
+    #[assoc(try_from_str = "x86_64-pc-windows-gnu")]
+    #[assoc(supported = true)]
+    #[assoc(uses_glibc = false)]
+    X86_64WindowsGNU,
+    #[assoc(as_str = "x86_64-pc-windows-msvc")]
+    #[assoc(try_from_str = "x86_64-pc-windows-msvc")]
+    #[assoc(supported = true)]
+    #[assoc(uses_glibc = false)]
+    X86_64WindowsMSVC,
+    #[assoc(as_str = "x86_64-unknown-linux-gnu")]
+    #[assoc(try_from_str = "x86_64-unknown-linux-gnu")]
+    #[assoc(supported = true)]
+    #[assoc(uses_glibc = true)]
+    X86_64LinuxGNU,
+
+    // This is a catch-all for all other unrecognized target triple strings.
+    // This variant mainly exists so that unsupported target triples do not
+    // cause errors on JSON deserialization. Otherwise, we would generally
+    // prefer to force callers to explicitly handle the case of unsupported
+    // triples.
+    #[assoc(as_str = _0.as_str())]
+    #[assoc(supported = false)]
+    #[assoc(uses_glibc = false)]
+    Unsupported(String),
 }
 
-impl RustcMetadata {
-    /// Get platform metadata from the current compiler.
-    #[instrument(name = "RustcMetadata::from_argv")]
-    pub async fn from_argv(
-        workspace_root: &AbsDirPath,
-        args: impl AsRef<CargoBuildArguments> + Debug,
-    ) -> Result<Self> {
-        // TODO: Is this the correct `rustc` to use? Do we need to specially
-        // handle interactions with `rustup` and `rust-toolchain.toml`?
-        let mut cmd = tokio::process::Command::new("rustc");
+// Even though we could implement `From` and provide `Unsupported` as a default,
+// we explicitly want to force callers to check for whether the target triple is
+// supported on conversions.
+impl TryFrom<&str> for RustcTargetPlatform {
+    type Error = eyre::Report;
 
-        // Bypasses the check that disallows using unstable commands on stable.
-        cmd.env("RUSTC_BOOTSTRAP", "1");
+    fn try_from(value: &str) -> Result<Self, Self::Error> {
+        Self::try_from_str(value).ok_or_eyre("unsupported target platform")
+    }
+}
 
-        // Forward the user's --target flag to rustc to get metadata for the
-        // correct target, not just the host.
-        cmd.args(["-Z", "unstable-options", "--print", "target-spec-json"]);
-        if let RustcTarget::Specified(target) = args.as_ref().target() {
-            cmd.args(["--target", &target]);
-        }
-        cmd.current_dir(workspace_root.as_std_path());
-        let output = cmd.output().await.context("run rustc")?;
-        if !output.status.success() {
-            return Err(eyre!("invoke rustc"))
-                .with_section(|| {
-                    String::from_utf8_lossy(&output.stdout)
-                        .to_string()
-                        .header("Stdout:")
-                })
-                .with_section(|| {
-                    String::from_utf8_lossy(&output.stderr)
-                        .to_string()
-                        .header("Stderr:")
-                });
-        }
+impl Display for RustcTargetPlatform {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
 
-        serde_json::from_slice::<RustcMetadata>(&output.stdout)
-            .context("parse rustc output")
-            .with_section(|| {
-                String::from_utf8_lossy(&output.stdout)
-                    .to_string()
-                    .header("Rustc Output:")
-            })
+impl Serialize for RustcTargetPlatform {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        self.as_str().serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for RustcTargetPlatform {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let s = String::deserialize(deserializer)?;
+        Self::try_from_str(&s)
+            .unwrap_or(Self::Unsupported(s))
+            .pipe(Ok)
     }
 }
 

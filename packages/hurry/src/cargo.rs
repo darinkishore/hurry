@@ -19,6 +19,7 @@ mod build_script;
 mod cache;
 mod dep_info;
 mod fingerprint;
+mod glibc;
 mod path;
 mod profile;
 mod rustc;
@@ -32,9 +33,10 @@ pub use build_script::BuildScriptOutput;
 pub use cache::{CargoCache, Restored, SaveProgress, SavedFile, save_units};
 pub use dep_info::{DepInfo, DepInfoLine};
 pub use fingerprint::Fingerprint;
+pub use glibc::host_glibc_version;
 pub use path::QualifiedPath;
 pub use profile::Profile;
-pub use rustc::{RustcArgument, RustcArguments, RustcMetadata, RustcTarget};
+pub use rustc::{RustcArgument, RustcArguments, RustcTarget, RustcTargetPlatform};
 pub use unit_graph::{
     UnitGraph, UnitGraphDependency, UnitGraphProfile, UnitGraphProfilePanicStrategy, UnitGraphUnit,
 };
