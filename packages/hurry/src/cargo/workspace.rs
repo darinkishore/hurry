@@ -17,7 +17,7 @@ use crate::{
     cargo::{
         self, BuildPlan, BuildScriptCompilationUnitPlan, BuildScriptExecutionUnitPlan,
         CargoBuildArguments, CargoCompileMode, LibraryCrateUnitPlan, Profile, RustcArguments,
-        RustcTarget,
+        RustcTarget, RustcTargetPlatform,
     },
     fs, mk_rel_dir,
     path::{AbsDirPath, AbsFilePath, RelDirPath, RelFilePath, RelativeTo as _, TryJoinWith as _},
@@ -56,7 +56,7 @@ pub struct Workspace {
     pub target_arch: RustcTarget,
 
     /// The architecture of the host machine.
-    pub host_arch: String,
+    pub host_arch: RustcTargetPlatform,
 }
 
 impl Workspace {
@@ -131,7 +131,11 @@ impl Workspace {
                             .header("Stderr:")
                     });
             }
-            String::from_utf8(output.stdout)?.trim().to_owned()
+            let output = String::from_utf8(output.stdout)?;
+            let output = output.trim();
+            output
+                .try_into()
+                .unwrap_or(RustcTargetPlatform::Unsupported(output.to_string()))
         };
 
         let profile = args.profile().map(Profile::from).unwrap_or(Profile::Debug);

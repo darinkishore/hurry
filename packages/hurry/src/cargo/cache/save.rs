@@ -1,11 +1,17 @@
-use color_eyre::Result;
+use color_eyre::{
+    Result,
+    eyre::{OptionExt as _, bail},
+};
 use futures::stream;
+use goblin::Object;
 use serde::{Deserialize, Serialize};
-use tracing::{instrument, trace};
+use tap::TryConv;
+use tracing::{info, instrument, trace};
 
 use crate::{
-    cargo::{Restored, UnitPlan, Workspace},
+    cargo::{Restored, RustcTarget, UnitPlan, Workspace},
     cas::CourierCas,
+    path::AbsFilePath,
 };
 use clients::{
     Courier,
@@ -55,8 +61,6 @@ pub async fn save_units(
             continue;
         }
 
-        let unit_arch = unit.info().target_arch.as_str().unwrap_or(&ws.host_arch);
-
         // Upload unit to CAS and cache.
         match unit {
             UnitPlan::LibraryCrate(plan) => {
@@ -66,12 +70,33 @@ pub async fn save_units(
                 // Prepare CAS objects.
                 let mut cas_uploads = Vec::new();
 
+                // TODO: For output files that are `.so` shared objects (e.g.
+                // from proc macros or cdylib unit kinds) compiled against
+                // glibc, we need to know the glibc version of the imported
+                // symbols in the object file.
+                let unit_arch = match &plan.info.target_arch {
+                    RustcTarget::Specified(target_arch) => target_arch,
+                    RustcTarget::ImplicitHost => &ws.host_arch,
+                };
+
                 let mut output_files = Vec::new();
                 for output_file in files.output_files {
-                    // TODO: For output files that are `.so` shared objects
-                    // (e.g. from proc macros or cdylib unit kinds) compiled
-                    // against glibc, we need to know the glibc version of the
-                    // imported symbols in the object file.
+                    let path = output_file
+                        .path
+                        .clone()
+                        .reconstruct(&ws, &plan.info)
+                        .try_conv::<AbsFilePath>()?;
+                    if unit_arch.uses_glibc() && path.as_std_path().ends_with(".so") {
+                        let object = Object::parse(&output_file.contents)?;
+                        match object {
+                            Object::Elf(elf) => {
+                                info!(?elf, "elf");
+                            }
+                            object => {
+                                bail!("expected ELF object, got {:?}", object)
+                            }
+                        }
+                    }
 
                     let object_key = Key::from_buffer(&output_file.contents);
                     output_files.push(
