@@ -76,7 +76,7 @@ impl CargoBuildArguments {
             .iter()
             .find_map(|arg| match arg {
                 CargoBuildArgument::Target(Some(t)) => Some(RustcTarget::Specified(
-                    RustcTargetPlatform::try_from_str(&t)
+                    RustcTargetPlatform::try_from_str(t)
                         .unwrap_or(RustcTargetPlatform::Unsupported(t.clone())),
                 )),
                 _ => None,

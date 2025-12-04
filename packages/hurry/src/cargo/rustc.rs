@@ -5,7 +5,7 @@ use std::{
 
 use color_eyre::{
     Report, Result,
-    eyre::{self, Context, OptionExt as _},
+    eyre::{Context, OptionExt as _},
 };
 use derive_more::Display;
 use enum_assoc::Assoc;
@@ -140,10 +140,10 @@ pub enum RustcTargetPlatform {
 // we explicitly want to force callers to check for whether the target triple is
 // supported on conversions.
 impl TryFrom<&str> for RustcTargetPlatform {
-    type Error = eyre::Report;
+    type Error = Report;
 
     fn try_from(value: &str) -> Result<Self, Self::Error> {
-        Self::try_from_str(value).ok_or_eyre("unsupported target platform")
+        Self::try_from_str(value).ok_or_eyre(format!("unsupported target platform: {}", value))
     }
 }
 
