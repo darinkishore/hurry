@@ -61,22 +61,26 @@ CREATE TABLE cas_access (
 --
 -- This table uses a JSONB-based approach for simplicity and flexibility:
 -- - SavedUnit types are directly serialized to JSONB without decomposition
--- - cache_key is a stable hash of SavedUnitCacheKey (includes unit hash + future fields)
+-- - cache_key is a stable hash of SavedUnitCacheKey (includes unit hash + libc version)
+-- - unit_hash and libc_version are stored separately for compatibility-based lookups
 -- - No impedance mismatch: Rust types ARE the storage format
 -- - Future-proof: Adding fields to SavedUnitCacheKey doesn't require schema changes
 --
--- Access pattern is simple key-value:
--- - Save: INSERT complete SavedUnit by cache_key
--- - Restore: SELECT by cache_key and deserialize
+-- Access pattern for compatibility-based restore:
+-- - Save: INSERT complete SavedUnit by cache_key, also store unit_hash and libc_version
+-- - Restore: SELECT by unit_hash, filter by libc compatibility
 --
 -- File contents are stored in CAS (deduplicated), JSONB only stores metadata.
 CREATE TABLE cargo_saved_unit (
   id BIGSERIAL PRIMARY KEY,
   organization_id BIGINT NOT NULL REFERENCES organization(id),
   cache_key TEXT NOT NULL,
+  unit_hash TEXT,
+  libc_version JSONB,
   data JSONB NOT NULL,
   created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
   UNIQUE(organization_id, cache_key)
 );
 
 CREATE INDEX idx_cargo_saved_unit_org_key ON cargo_saved_unit(organization_id, cache_key);
+CREATE INDEX idx_cargo_saved_unit_org_unit_hash ON cargo_saved_unit(organization_id, unit_hash);

@@ -5,7 +5,10 @@ use clients::{
 };
 use color_eyre::Result;
 use derive_more::Debug;
-use hurry::cargo::{CargoBuildArguments, Workspace};
+use hurry::{
+    cargo::{CargoBuildArguments, Workspace},
+    host::detect_host_libc,
+};
 use url::Url;
 
 #[derive(Clone, Args, Debug)]
@@ -55,6 +58,7 @@ pub async fn exec(opts: Options) -> Result<()> {
         .collect::<Vec<_>>();
 
     let courier = Courier::new(opts.courier_url, opts.courier_token)?;
+    let host_libc = detect_host_libc();
 
     println!("Found {} matching units:", matching_units.len());
     for unit in matching_units {
@@ -95,6 +99,7 @@ pub async fn exec(opts: Options) -> Result<()> {
 
         let key = SavedUnitCacheKey::builder()
             .unit_hash(info.unit_hash.clone())
+            .libc_version(host_libc.clone())
             .build();
         let mut cached = courier
             .cargo_cache_restore(CargoRestoreRequest::new([key.clone()]))

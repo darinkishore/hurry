@@ -18,6 +18,7 @@ use crate::{
     cargo::{self, QualifiedPath, UnitHash, UnitPlan, Workspace},
     cas::CourierCas,
     fs,
+    host::detect_host_libc,
     path::JoinWith as _,
     progress::TransferBar,
 };
@@ -82,6 +83,10 @@ pub async fn restore_units(
 ) -> Result<Restored> {
     trace!(?units, "units");
 
+    // Detect host libc version once at the start for use in all cache keys
+    let host_libc = detect_host_libc();
+    trace!(?host_libc, "detected host libc version for cache keys");
+
     let restored = Restored::default();
 
     // Check which units are already on disk, and don't attempt to restore them.
@@ -121,6 +126,7 @@ pub async fn restore_units(
             .map(|unit| {
                 SavedUnitCacheKey::builder()
                     .unit_hash(unit.info().unit_hash.clone())
+                    .libc_version(host_libc.clone())
                     .build()
             }),
     );
@@ -210,6 +216,7 @@ pub async fn restore_units(
         let saved = saved_units.take(
             &SavedUnitCacheKey::builder()
                 .unit_hash(unit_hash.clone())
+                .libc_version(host_libc.clone())
                 .build(),
         );
         let Some(saved) = saved else {

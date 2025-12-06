@@ -11,5 +11,6 @@ pub mod cross;
 pub mod daemon;
 pub mod ext;
 pub mod fs;
+pub mod host;
 pub mod path;
 pub mod progress;

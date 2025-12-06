@@ -15,7 +15,7 @@ use clients::courier::v1::{
 };
 use color_eyre::{
     Result,
-    eyre::{Context, bail, eyre},
+    eyre::{Context, bail},
 };
 use derive_more::Debug;
 use futures::StreamExt;
@@ -78,12 +78,16 @@ impl Postgres {
         for item in request {
             let data = serde_json::to_value(&item.unit)
                 .with_context(|| format!("serialize data to json: {:?}", item.unit))?;
+            let libc_version = serde_json::to_value(item.key.libc_version())
+                .with_context(|| format!("serialize libc_version: {:?}", item.key.libc_version()))?;
             sqlx::query!(
-                "insert into cargo_saved_unit (organization_id, cache_key, data)
-                values ($1, $2, $3)
+                "insert into cargo_saved_unit (organization_id, cache_key, unit_hash, libc_version, data)
+                values ($1, $2, $3, $4, $5)
                 on conflict do nothing",
                 auth.org_id.as_i64(),
                 item.key.stable_hash(),
+                item.key.unit_hash.as_str(),
+                libc_version,
                 data,
             )
             .execute(tx.as_mut())
@@ -100,39 +104,112 @@ impl Postgres {
         auth: &AuthenticatedToken,
         request: CargoRestoreRequest,
     ) -> Result<HashMap<SavedUnitCacheKey, SavedUnit>> {
-        // When we store `SavedUnitCacheKey` in the database we store it by its stable
-        // hash, so there's no way to get the original value back out using just the
-        // query. Instead we build a map of "hashes to original values" and use that to
-        // fetch the originals back out.
-        let mut request_hashes = request
+        use clients::courier::v1::cache::LibcVersion;
+
+        // Build a map of unit_hash -> requested cache key for later reconstruction.
+        // The request contains the host's libc version; we'll use it to filter compatible
+        // cached artifacts.
+        let request_by_unit_hash = request
             .into_iter()
-            .map(|item| (item.stable_hash(), item))
+            .map(|item| (item.unit_hash.as_str().to_owned(), item))
             .collect::<HashMap<_, _>>();
 
-        // Postgres however does need us to pass in a vec of owned strings.
+        // Query by unit_hash to find all potentially compatible cached units.
         let mut rows = sqlx::query!(
-            "select cache_key, data
+            "select unit_hash, libc_version, data
             from cargo_saved_unit
             where organization_id = $1
-            and cache_key = any($2)",
+            and unit_hash = any($2)",
             auth.org_id.as_i64(),
-            &request_hashes.keys().cloned().collect::<Vec<_>>(),
+            &request_by_unit_hash.keys().cloned().collect::<Vec<_>>(),
         )
         .fetch(&self.pool);
 
-        let mut artifacts = HashMap::with_capacity(request_hashes.len());
+        // For each unit_hash, we may find multiple cached entries with different libc
+        // versions. We need to:
+        // 1. Filter to only those that are compatible (host can_run cached)
+        // 2. Prefer exact matches over compatible-but-different versions
+        // 3. If no exact match, pick the newest compatible version
+        let mut candidates: HashMap<String, Vec<(LibcVersion, SavedUnit)>> = HashMap::new();
+
         while let Some(row) = rows.next().await {
             let row = row.context("read rows")?;
+            let Some(unit_hash) = row.unit_hash else {
+                // Old rows without unit_hash column - skip
+                continue;
+            };
+            let Some(libc_json) = row.libc_version else {
+                // Old rows without libc_version column - skip
+                continue;
+            };
 
-            // We remove as we go because we expect at most one match per key, and this
-            // allows us to avoid a clone.
-            let key = request_hashes
-                .remove(&row.cache_key)
-                .ok_or_else(|| eyre!("matched key not in the request: {}", row.cache_key))?;
+            let cached_libc = serde_json::from_value::<LibcVersion>(libc_json)
+                .with_context(|| format!("deserialize libc_version for unit: {unit_hash}"))?;
             let unit = serde_json::from_value::<SavedUnit>(row.data)
-                .with_context(|| format!("deserialize value for cache key: {}", row.cache_key))?;
+                .with_context(|| format!("deserialize data for unit: {unit_hash}"))?;
 
-            artifacts.insert(key, unit);
+            candidates
+                .entry(unit_hash)
+                .or_default()
+                .push((cached_libc, unit));
+        }
+
+        // Now filter and select the best match for each requested unit_hash
+        let mut artifacts = HashMap::with_capacity(request_by_unit_hash.len());
+        for (unit_hash, requested_key) in request_by_unit_hash {
+            let Some(unit_candidates) = candidates.remove(&unit_hash) else {
+                // No cached entries for this unit_hash
+                debug!(?unit_hash, "no cached entries found");
+                continue;
+            };
+
+            let host_libc = requested_key.libc_version();
+
+            // Find compatible candidates and prefer exact match
+            let mut best_match: Option<(LibcVersion, SavedUnit)> = None;
+            for (cached_libc, unit) in unit_candidates {
+                if !host_libc.can_run(&cached_libc) {
+                    debug!(
+                        ?unit_hash,
+                        ?host_libc,
+                        ?cached_libc,
+                        "cached entry incompatible"
+                    );
+                    continue;
+                }
+
+                // Compatible! Check if it's a better match than current best.
+                match &best_match {
+                    None => {
+                        // First compatible match
+                        best_match = Some((cached_libc, unit));
+                    }
+                    Some((best_libc, _)) => {
+                        // Prefer exact match, otherwise prefer newer (larger) version
+                        if &cached_libc == host_libc {
+                            // Exact match - use it
+                            best_match = Some((cached_libc, unit));
+                        } else if best_libc != host_libc && cached_libc > *best_libc {
+                            // Neither is exact, prefer newer
+                            best_match = Some((cached_libc, unit));
+                        }
+                    }
+                }
+            }
+
+            if let Some((matched_libc, unit)) = best_match {
+                debug!(
+                    ?unit_hash,
+                    ?host_libc,
+                    ?matched_libc,
+                    "found compatible cached entry"
+                );
+                // Return with the original requested key (which has the host's libc)
+                // so the client can match it back to the request
+                artifacts.insert(requested_key, unit);
+            } else {
+                debug!(?unit_hash, ?host_libc, "no compatible cached entries");
+            }
         }
 
         Ok(artifacts)

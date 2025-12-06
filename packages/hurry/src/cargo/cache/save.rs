@@ -6,6 +6,7 @@ use tracing::{instrument, trace};
 use crate::{
     cargo::{Restored, UnitPlan, Workspace},
     cas::CourierCas,
+    host::detect_host_libc,
 };
 use clients::{
     Courier,
@@ -33,6 +34,10 @@ pub async fn save_units(
     mut on_progress: impl FnMut(&SaveProgress),
 ) -> Result<()> {
     trace!(?units, "units");
+
+    // Detect host libc version once at the start for use in all cache keys
+    let host_libc = detect_host_libc();
+    trace!(?host_libc, "detected host libc version for cache keys");
 
     let mut progress = SaveProgress {
         uploaded_units: 0,
@@ -112,6 +117,7 @@ pub async fn save_units(
                     .key(
                         SavedUnitCacheKey::builder()
                             .unit_hash(plan.info.clone().unit_hash)
+                            .libc_version(host_libc.clone())
                             .build(),
                     )
                     .unit(courier::SavedUnit::LibraryCrate(
@@ -167,6 +173,7 @@ pub async fn save_units(
                     .key(
                         SavedUnitCacheKey::builder()
                             .unit_hash(plan.info.clone().unit_hash)
+                            .libc_version(host_libc.clone())
                             .build(),
                     )
                     .unit(courier::SavedUnit::BuildScriptCompilation(
@@ -233,6 +240,7 @@ pub async fn save_units(
                     .key(
                         SavedUnitCacheKey::builder()
                             .unit_hash(plan.info.clone().unit_hash)
+                            .libc_version(host_libc.clone())
                             .build(),
                     )
                     .unit(courier::SavedUnit::BuildScriptExecution(
