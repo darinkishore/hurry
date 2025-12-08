@@ -23,8 +23,9 @@ use crate::courier::v1::{SavedUnit, SavedUnitHash};
 /// - Glibc: Forward-compatible. A binary built against glibc 2.17 can run on
 ///   glibc 2.31, but NOT vice versa. The host version must be >= cached
 ///   version.
-/// - Darwin: Forward-compatible. A binary targeting macOS 12.0 can run on macOS
-///   14.0, but NOT vice versa.
+/// - Darwin: Forward-compatible. A binary targeting macOS 11.0 deployment
+///   target can run on macOS 14.0, but NOT vice versa. Uses the rustc
+///   deployment target, not the Darwin kernel version.
 /// - Musl: Typically statically linked, so version is less critical.
 /// - Windows: No libc compatibility concerns for this use case.
 #[derive(Clone, Eq, PartialEq, Ord, PartialOrd, Hash, Debug, Serialize, Deserialize)]
@@ -38,7 +39,9 @@ pub enum LibcVersion {
     /// statically linked.
     Musl,
 
-    /// macOS/Darwin with major.minor version (e.g., 23.0 for macOS 14).
+    /// macOS with deployment target version (e.g., 11.0 for Big Sur, 14.0 for
+    /// Sonoma). This is the macOS version, not the Darwin kernel version.
+    /// Determined by `rustc --print deployment-target`.
     Darwin { major: u32, minor: u32 },
 
     /// Windows. No libc compatibility concerns for cached Rust artifacts.
@@ -120,7 +123,7 @@ impl std::fmt::Display for LibcVersion {
         match self {
             LibcVersion::Glibc { major, minor } => write!(f, "glibc {major}.{minor}"),
             LibcVersion::Musl => write!(f, "musl"),
-            LibcVersion::Darwin { major, minor } => write!(f, "Darwin {major}.{minor}"),
+            LibcVersion::Darwin { major, minor } => write!(f, "macOS {major}.{minor}"),
             LibcVersion::Windows => write!(f, "Windows"),
             LibcVersion::Unknown => write!(f, "unknown"),
         }
@@ -591,11 +594,11 @@ mod tests {
         );
         pretty_assert_eq!(
             LibcVersion::Darwin {
-                major: 23,
+                major: 14,
                 minor: 0
             }
             .to_string(),
-            "Darwin 23.0"
+            "macOS 14.0"
         );
         pretty_assert_eq!(LibcVersion::Musl.to_string(), "musl");
         pretty_assert_eq!(LibcVersion::Windows.to_string(), "Windows");

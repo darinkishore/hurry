@@ -86,44 +86,60 @@ fn detect_glibc() -> Result<LibcVersion> {
     Ok(LibcVersion::Glibc { major, minor })
 }
 
-/// Detect Darwin (macOS) version using uname.
+/// Detect macOS deployment target using `rustc --print deployment-target`.
+///
+/// This queries rustc directly for the deployment target it will use when
+/// compiling. This is more accurate than using the Darwin kernel version
+/// because:
+/// 1. It respects the `MACOSX_DEPLOYMENT_TARGET` environment variable
+/// 2. It uses rustc's built-in minimums (e.g., 11.0 for aarch64)
+/// 3. It matches what actually gets embedded in the compiled binaries
+///
+/// The version returned is the macOS version (e.g., 11.0 for Big Sur, 14.0
+/// for Sonoma), not the Darwin kernel version.
 #[cfg(target_os = "macos")]
 fn detect_darwin() -> Result<LibcVersion> {
     use color_eyre::eyre::{Context, bail};
-    use std::ffi::CStr;
-    use std::mem::MaybeUninit;
+    use std::process::Command;
 
-    // Use uname to get the Darwin kernel version
-    let mut utsname = MaybeUninit::<libc::utsname>::uninit();
+    // Run rustc to get the deployment target
+    let output = Command::new("rustc")
+        .args(["--print", "deployment-target"])
+        .output()
+        .context("failed to run rustc --print deployment-target")?;
 
-    // SAFETY: uname writes to the provided buffer and returns 0 on success
-    let result = unsafe { libc::uname(utsname.as_mut_ptr()) };
-    if result != 0 {
-        bail!("uname failed with result: {result}");
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        bail!("rustc --print deployment-target failed: {stderr}");
     }
 
-    // SAFETY: uname succeeded, so utsname is now initialized
-    let utsname = unsafe { utsname.assume_init() };
+    let stdout = String::from_utf8(output.stdout).context("rustc output is not valid UTF-8")?;
 
-    // SAFETY: release is a null-terminated C string filled by uname
-    let release = unsafe { CStr::from_ptr(utsname.release.as_ptr()) }
-        .to_str()
-        .context("Darwin release is not valid UTF-8")?;
+    // Output format: "MACOSX_DEPLOYMENT_TARGET=11.0\n"
+    let line = stdout.trim();
+    debug!(output = %line, "rustc deployment target output");
 
-    debug!(release = %release, "detected Darwin release");
+    let version_str = line
+        .strip_prefix("MACOSX_DEPLOYMENT_TARGET=")
+        .ok_or_else(|| color_eyre::eyre::eyre!("unexpected rustc output format: {line}"))?;
 
-    // Parse version string like "24.6.0" (Darwin version)
-    let parts = release.split('.').collect::<Vec<_>>();
-    if parts.len() < 2 {
-        bail!("unexpected Darwin version format: {release}");
+    // Parse version string like "11.0" or "14.0"
+    let parts = version_str.split('.').collect::<Vec<_>>();
+    if parts.is_empty() {
+        bail!("unexpected macOS version format: {version_str}");
     }
 
     let major = parts[0]
         .parse::<u32>()
-        .context("failed to parse Darwin major version")?;
-    let minor = parts[1]
-        .parse::<u32>()
-        .context("failed to parse Darwin minor version")?;
+        .context("failed to parse macOS major version")?;
+    let minor = parts
+        .get(1)
+        .map(|s| s.parse::<u32>())
+        .transpose()
+        .context("failed to parse macOS minor version")?
+        .unwrap_or(0);
+
+    debug!(major, minor, "detected macOS deployment target");
 
     Ok(LibcVersion::Darwin { major, minor })
 }
@@ -163,11 +179,12 @@ mod tests {
         {
             match version {
                 LibcVersion::Darwin { major, minor } => {
-                    // Darwin 20+ corresponds to macOS 11+
-                    assert!(major >= 15, "Darwin version should be >= 15 (macOS 10.11+)");
+                    // macOS deployment target should be >= 10 (we use macOS version now)
+                    // aarch64 minimum is 11.0, x86_64 minimum is 10.12
+                    assert!(major >= 10, "macOS deployment target should be >= 10");
                     assert!(
                         minor < 100,
-                        "Darwin minor version should be reasonable (<100)"
+                        "macOS minor version should be reasonable (<100)"
                     );
                 }
                 _ => panic!("expected Darwin on macOS, got {version:?}"),
