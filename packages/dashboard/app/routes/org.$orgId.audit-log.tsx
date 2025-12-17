@@ -197,6 +197,7 @@ export default function OrgAuditLogPage() {
 function formatTimestamp(iso: string): string {
   const date = new Date(iso);
   return date.toLocaleString(undefined, {
+    year: "numeric",
     month: "short",
     day: "numeric",
     hour: "2-digit",
