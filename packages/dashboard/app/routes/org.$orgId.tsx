@@ -122,8 +122,13 @@ export default function OrgLayout() {
           <Tab to="" label="Overview" end />
           <Tab to="members" label="Members" />
           <Tab to="api-keys" label="API Keys" />
-          <Tab to="invitations" label="Invitations" />
-          <Tab to="bots" label="Bots" />
+          {org?.role === "admin" ? (
+            <>
+              <Tab to="invitations" label="Invitations" />
+              <Tab to="bots" label="Bots" />
+              <Tab to="audit-log" label="Audit Log" />
+            </>
+          ) : null}
         </div>
       </div>
 
