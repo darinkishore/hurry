@@ -255,8 +255,9 @@ pub async fn restore_units(
                 UnitPlan::LibraryCrate(unit_plan),
             ) => {
                 // Parse the fingerprint from cached data.
-                let fingerprint =
-                    serde_json::from_str::<cargo::Fingerprint>(saved_library_files.fingerprint.as_str())?;
+                let fingerprint = serde_json::from_str::<cargo::Fingerprint>(
+                    saved_library_files.fingerprint.as_str(),
+                )?;
 
                 // Handle skipped units: record fingerprint mapping but don't restore files.
                 if units_to_skip.contains(unit_hash) {
@@ -357,8 +358,9 @@ pub async fn restore_units(
                 UnitPlan::BuildScriptCompilation(unit_plan),
             ) => {
                 // Parse the fingerprint from cached data.
-                let fingerprint =
-                    serde_json::from_str::<cargo::Fingerprint>(build_script_compiled_files.fingerprint.as_str())?;
+                let fingerprint = serde_json::from_str::<cargo::Fingerprint>(
+                    build_script_compiled_files.fingerprint.as_str(),
+                )?;
 
                 // Handle skipped units: record fingerprint mapping but don't restore files.
                 if units_to_skip.contains(unit_hash) {
@@ -458,8 +460,9 @@ pub async fn restore_units(
                 UnitPlan::BuildScriptExecution(unit_plan),
             ) => {
                 // Parse the fingerprint from cached data.
-                let fingerprint =
-                    serde_json::from_str::<cargo::Fingerprint>(build_script_output_files.fingerprint.as_str())?;
+                let fingerprint = serde_json::from_str::<cargo::Fingerprint>(
+                    build_script_output_files.fingerprint.as_str(),
+                )?;
 
                 // Handle skipped units: record fingerprint mapping but don't restore files.
                 if units_to_skip.contains(unit_hash) {
