@@ -159,7 +159,7 @@ export default function OrgAuditLogPage() {
             {hasCursor ? (
               <button
                 type="button"
-                className="text-accent-text hover:underline"
+                className="cursor-pointer text-accent-text hover:underline"
                 onClick={goFirst}
               >
                 Back to latest
