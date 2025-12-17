@@ -11,6 +11,8 @@ import { useOrgContext } from "./org.$orgId";
 
 const PAGE_SIZE = 25;
 
+type Cursor = { time: string; id: string };
+
 export default function OrgAuditLogPage() {
   const toast = useToast();
   const { request, signedIn } = useApi();
@@ -22,7 +24,9 @@ export default function OrgAuditLogPage() {
   const [searchParams, setSearchParams] = useSearchParams();
   const cursorTime = searchParams.get("cursor_time");
   const cursorId = searchParams.get("cursor_id");
-  const hasCursor = cursorTime !== null && cursorId !== null;
+
+  // Track cursor history for "Newer" navigation without relying on browser history
+  const [cursorHistory, setCursorHistory] = useState<Cursor[]>([]);
 
   const canAdmin = role === "admin";
   const entries = useMemo(() => data?.entries ?? [], [data]);
@@ -55,15 +59,30 @@ export default function OrgAuditLogPage() {
   function goNext() {
     if (!hasMore || entries.length === 0) return;
     const last = entries[entries.length - 1];
+    // Save current cursor to history before navigating forward
+    if (cursorTime && cursorId) {
+      setCursorHistory((prev) => [...prev, { time: cursorTime, id: cursorId }]);
+    } else {
+      // First page has no cursor, use empty marker
+      setCursorHistory((prev) => [...prev, { time: "", id: "" }]);
+    }
     setSearchParams({ cursor_time: last.created_at, cursor_id: String(last.id) });
   }
 
   function goPrev() {
-    // Browser back button handles this naturally, but we can also clear params to go to latest
-    window.history.back();
+    if (cursorHistory.length === 0) return;
+    const prev = cursorHistory[cursorHistory.length - 1];
+    setCursorHistory((h) => h.slice(0, -1));
+    if (prev.time === "" && prev.id === "") {
+      // Go back to first page
+      setSearchParams({});
+    } else {
+      setSearchParams({ cursor_time: prev.time, cursor_id: prev.id });
+    }
   }
 
   function goFirst() {
+    setCursorHistory([]);
     setSearchParams({});
   }
 
@@ -156,7 +175,7 @@ export default function OrgAuditLogPage() {
 
         <div className="mt-4 flex items-center justify-between border-t border-border-subtle pt-4">
           <div className="text-xs text-content-muted">
-            {hasCursor ? (
+            {cursorHistory.length > 0 ? (
               <button
                 type="button"
                 className="cursor-pointer text-accent-text hover:underline"
@@ -172,7 +191,7 @@ export default function OrgAuditLogPage() {
             <Button
               variant="secondary"
               size="sm"
-              disabled={!hasCursor}
+              disabled={cursorHistory.length === 0}
               onClick={goPrev}
             >
               <ChevronLeft className="h-4 w-4" />
