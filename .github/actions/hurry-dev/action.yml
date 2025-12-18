@@ -8,6 +8,11 @@
 name: hurry-dev
 description: Install and use hurry-dev (local development version)
 
+inputs:
+    hurry-api-token:
+        description: "Hurry API token for caching"
+        required: true
+
 runs:
     using: composite
     steps:
@@ -55,6 +60,8 @@ runs:
         - name: Build hurry binary
           if: steps.check-path.outputs.found != 'true' && steps.check-download.outputs.found != 'true'
           shell: bash
+          env:
+              HURRY_API_TOKEN: ${{ inputs.hurry-api-token }}
           run: hurry cargo build --release --package hurry --verbose
 
         - name: Copy built binary to /tmp/hurry
