@@ -151,8 +151,8 @@ function GettingStartedInstallTabs() {
   const [platform, setPlatform] = useState<Platform>(detectPlatform);
 
   const commands = {
-    unix: "curl -sSfL https://hurry-releases.s3.amazonaws.com/install.sh | bash",
-    windows: "irm https://hurry-releases.s3.amazonaws.com/install.ps1 | iex",
+    unix: "curl -sSfL https://hurry.build/install.sh | bash",
+    windows: "irm https://hurry.build/install.ps1 | iex",
   };
 
   return (
