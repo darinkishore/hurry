@@ -122,8 +122,10 @@ impl Disk {
         // This also allows us to add new volumes at different levels in the
         // future if we need to do so for storage or other reasons.
         let hex = key.to_hex();
-        let prefix1 = hex.chars().take(2).collect::<String>();
-        let prefix2 = hex.chars().skip(2).take(2).collect::<String>();
+        // Use string slicing instead of char iteration for efficiency.
+        // This is safe because hex strings are guaranteed to be ASCII (0-9, a-f).
+        let prefix1 = &hex[0..2];
+        let prefix2 = &hex[2..4];
         self.root.join(prefix1).join(prefix2).join(&hex)
     }
 
