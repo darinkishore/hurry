@@ -402,3 +402,164 @@ impl FromRequestParts<api::State> for SessionContext {
         }
     }
 }
+
+/// Centralized API error type for consistent error responses.
+///
+/// This enum provides a unified way to handle common API errors across all
+/// handlers, reducing duplication and ensuring consistent HTTP responses.
+#[derive(Debug)]
+pub enum ApiError {
+    /// The user is not authorized to perform this action.
+    Forbidden(&'static str),
+
+    /// The requested resource was not found.
+    NotFound(&'static str),
+
+    /// The request was malformed or invalid.
+    BadRequest(&'static str),
+
+    /// An internal server error occurred.
+    Internal(String),
+}
+
+impl std::fmt::Display for ApiError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ApiError::Forbidden(msg) => write!(f, "Forbidden: {}", msg),
+            ApiError::NotFound(msg) => write!(f, "Not found: {}", msg),
+            ApiError::BadRequest(msg) => write!(f, "Bad request: {}", msg),
+            ApiError::Internal(msg) => write!(f, "Internal error: {}", msg),
+        }
+    }
+}
+
+impl std::error::Error for ApiError {}
+
+impl axum::response::IntoResponse for ApiError {
+    fn into_response(self) -> axum::response::Response {
+        match self {
+            ApiError::Forbidden(msg) => (StatusCode::FORBIDDEN, msg).into_response(),
+            ApiError::NotFound(msg) => (StatusCode::NOT_FOUND, msg).into_response(),
+            ApiError::BadRequest(msg) => (StatusCode::BAD_REQUEST, msg).into_response(),
+            ApiError::Internal(msg) => (StatusCode::INTERNAL_SERVER_ERROR, msg).into_response(),
+        }
+    }
+}
+
+/// A session context with verified admin role for a specific organization.
+///
+/// This type can only be created by calling [`SessionContext::try_admin`],
+/// which verifies that the user has admin privileges in the organization.
+/// This provides compile-time guarantees that admin-only operations are
+/// properly guarded.
+#[derive(Clone, Debug)]
+pub struct SessionAdmin {
+    /// The account ID of the authenticated admin.
+    pub account_id: AccountId,
+
+    /// The organization ID where the user has admin privileges.
+    pub org_id: OrgId,
+}
+
+/// A session context with verified membership for a specific organization.
+///
+/// This type can only be created by calling [`SessionContext::try_member`],
+/// which verifies that the user is a member of the organization.
+/// This provides compile-time guarantees that member-only operations are
+/// properly guarded.
+#[derive(Clone, Debug)]
+pub struct SessionMember {
+    /// The account ID of the authenticated member.
+    pub account_id: AccountId,
+
+    /// The organization ID where the user has membership.
+    pub org_id: OrgId,
+
+    /// The user's role in the organization.
+    pub role: OrgRole,
+}
+
+impl SessionContext {
+    /// Verify that the user has admin privileges in the specified organization.
+    ///
+    /// Returns a [`SessionAdmin`] if the user is an admin, or an [`ApiError`]
+    /// if they are not authorized.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// async fn handle(
+    ///     Dep(db): Dep<Postgres>,
+    ///     session: SessionContext,
+    ///     Path(org_id): Path<i64>,
+    /// ) -> Result<Response, ApiError> {
+    ///     let org_id = OrgId::from_i64(org_id);
+    ///     let admin = session.try_admin(&db, org_id).await?;
+    ///     // Now we have compile-time proof that the user is an admin
+    ///     Ok(Response::Success)
+    /// }
+    /// ```
+    pub async fn try_admin(
+        &self,
+        db: &db::Postgres,
+        org_id: OrgId,
+    ) -> Result<SessionAdmin, ApiError> {
+        match db.get_member_role(org_id, self.account_id).await {
+            Ok(Some(role)) if role.is_admin() => Ok(SessionAdmin {
+                account_id: self.account_id,
+                org_id,
+            }),
+            Ok(Some(_)) => Err(ApiError::Forbidden("Admin access required")),
+            Ok(None) => Err(ApiError::Forbidden("Not a member of this organization")),
+            Err(e) => {
+                tracing::error!(?e, "Failed to check member role");
+                Err(ApiError::Internal(e.to_string()))
+            }
+        }
+    }
+
+    /// Verify that the user is a member of the specified organization.
+    ///
+    /// Returns a [`SessionMember`] if the user is a member (with any role),
+    /// or an [`ApiError`] if they are not authorized.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// async fn handle(
+    ///     Dep(db): Dep<Postgres>,
+    ///     session: SessionContext,
+    ///     Path(org_id): Path<i64>,
+    /// ) -> Result<Response, ApiError> {
+    ///     let org_id = OrgId::from_i64(org_id);
+    ///     let member = session.try_member(&db, org_id).await?;
+    ///     // Now we have compile-time proof that the user is a member
+    ///     Ok(Response::Success)
+    /// }
+    /// ```
+    pub async fn try_member(
+        &self,
+        db: &db::Postgres,
+        org_id: OrgId,
+    ) -> Result<SessionMember, ApiError> {
+        match db.get_member_role(org_id, self.account_id).await {
+            Ok(Some(role)) => Ok(SessionMember {
+                account_id: self.account_id,
+                org_id,
+                role,
+            }),
+            Ok(None) => Err(ApiError::Forbidden("Not a member of this organization")),
+            Err(e) => {
+                tracing::error!(?e, "Failed to check member role");
+                Err(ApiError::Internal(e.to_string()))
+            }
+        }
+    }
+}
+
+impl SessionMember {
+    /// Check if this member has admin privileges.
+    pub fn is_admin(&self) -> bool {
+        self.role.is_admin()
+    }
+}

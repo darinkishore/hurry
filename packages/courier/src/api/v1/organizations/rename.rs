@@ -7,7 +7,7 @@ use serde_json::json;
 use tracing::{error, info, warn};
 
 use crate::{
-    auth::{OrgId, SessionContext},
+    auth::{ApiError, OrgId, SessionContext},
     db::Postgres,
 };
 
@@ -24,7 +24,7 @@ pub async fn handle(
     session: SessionContext,
     Path(org_id): Path<i64>,
     Json(request): Json<RenameOrganizationRequest>,
-) -> Response {
+) -> Result<Response, ApiError> {
     let org_id = OrgId::from_i64(org_id);
 
     // Validate name is not empty
@@ -35,39 +35,17 @@ pub async fn handle(
             org_id = %org_id,
             "organizations.rename.empty_name"
         );
-        return Response::EmptyName;
+        return Ok(Response::EmptyName);
     }
 
-    // Check that the user is an admin of the organization
-    match db.get_member_role(org_id, session.account_id).await {
-        Ok(Some(role)) if role.is_admin() => {}
-        Ok(Some(_)) => {
-            warn!(
-                account_id = %session.account_id,
-                org_id = %org_id,
-                "organizations.rename.not_admin"
-            );
-            return Response::Forbidden;
-        }
-        Ok(None) => {
-            warn!(
-                account_id = %session.account_id,
-                org_id = %org_id,
-                "organizations.rename.not_member"
-            );
-            return Response::Forbidden;
-        }
-        Err(error) => {
-            error!(?error, "organizations.rename.role_check_error");
-            return Response::Error(error.to_string());
-        }
-    }
+    // Verify admin access using strongly typed role check
+    let admin = session.try_admin(&db, org_id).await?;
 
     match db.rename_organization(org_id, name).await {
         Ok(true) => {
             let _ = db
                 .log_audit_event(
-                    Some(session.account_id),
+                    Some(admin.account_id),
                     Some(org_id),
                     "organization.renamed",
                     Some(json!({
@@ -81,12 +59,12 @@ pub async fn handle(
                 new_name = %name,
                 "organizations.rename.success"
             );
-            Response::Success
+            Ok(Response::Success)
         }
-        Ok(false) => Response::NotFound,
+        Ok(false) => Ok(Response::NotFound),
         Err(error) => {
             error!(?error, "organizations.rename.error");
-            Response::Error(error.to_string())
+            Ok(Response::Error(error.to_string()))
         }
     }
 }
@@ -95,7 +73,6 @@ pub async fn handle(
 pub enum Response {
     Success,
     EmptyName,
-    Forbidden,
     NotFound,
     Error(String),
 }
@@ -107,11 +84,6 @@ impl IntoResponse for Response {
             Response::EmptyName => {
                 (StatusCode::BAD_REQUEST, "Organization name cannot be empty").into_response()
             }
-            Response::Forbidden => (
-                StatusCode::FORBIDDEN,
-                "Only admins can rename the organization",
-            )
-                .into_response(),
             Response::NotFound => (StatusCode::NOT_FOUND, "Organization not found").into_response(),
             Response::Error(msg) => (StatusCode::INTERNAL_SERVER_ERROR, msg).into_response(),
         }
