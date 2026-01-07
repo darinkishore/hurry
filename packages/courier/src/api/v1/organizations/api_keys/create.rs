@@ -83,7 +83,9 @@ pub async fn handle(
                 })),
                 Ok(None) => {
                     error!(key_id = %key_id, "organizations.api_keys.create.not_found_after_create");
-                    Ok(Response::Error(String::from("Key not found after creation")))
+                    Ok(Response::Error(String::from(
+                        "Key not found after creation",
+                    )))
                 }
                 Err(error) => {
                     error!(?error, "organizations.api_keys.create.fetch_error");

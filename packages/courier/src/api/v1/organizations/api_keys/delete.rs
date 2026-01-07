@@ -42,7 +42,9 @@ pub async fn handle(
 
     // Check if user can delete: must be key owner or admin
     if key.account_id != member.account_id && !member.role.is_admin() {
-        return Err(ApiError::Forbidden("Only admins or the key owner can delete API keys"));
+        return Err(ApiError::Forbidden(
+            "Only admins or the key owner can delete API keys",
+        ));
     }
 
     match db.revoke_api_key(key_id).await {
