@@ -15,11 +15,31 @@ pub async fn handle(
     Dep(db): Dep<Postgres>,
     session: SessionContext,
     Path(org_id): Path<i64>,
-) -> Result<Response, ApiError> {
+) -> Response {
     let org_id = OrgId::from_i64(org_id);
 
     // Verify membership using strongly typed role check
-    let member = session.try_member(&db, org_id).await?;
+    // For the leave endpoint, we return NotFound instead of Forbidden for
+    // non-members to avoid leaking information about organization existence
+    let member = match session.try_member(&db, org_id).await {
+        Ok(member) => member,
+        Err(ApiError::Forbidden(_)) => {
+            warn!(
+                account_id = %session.account_id,
+                org_id = %org_id,
+                "organizations.leave.not_member"
+            );
+            return Response::NotFound;
+        }
+        Err(ApiError::Internal(msg)) => {
+            error!("organizations.leave.role_check_error: {}", msg);
+            return Response::Error(msg);
+        }
+        Err(e) => {
+            error!("organizations.leave.unexpected_error: {}", e);
+            return Response::Error(e.to_string());
+        }
+    };
 
     if member.role.is_admin() {
         match db.is_last_admin(org_id, member.account_id).await {
@@ -29,12 +49,12 @@ pub async fn handle(
                     org_id = %org_id,
                     "organizations.leave.last_admin"
                 );
-                return Ok(Response::LastAdmin);
+                return Response::LastAdmin;
             }
             Ok(false) => {}
             Err(error) => {
                 error!(?error, "organizations.leave.last_admin_check_error");
-                return Ok(Response::Error(error.to_string()));
+                return Response::Error(error.to_string());
             }
         }
     }
@@ -50,7 +70,7 @@ pub async fn handle(
         Ok(count) => count,
         Err(error) => {
             error!(?error, "organizations.leave.revoke_keys_error");
-            return Ok(Response::Error(error.to_string()));
+            return Response::Error(error.to_string());
         }
     };
 
@@ -76,12 +96,12 @@ pub async fn handle(
                 keys_revoked = %keys_revoked,
                 "organizations.leave.success"
             );
-            Ok(Response::Success)
+            Response::Success
         }
-        Ok(false) => Ok(Response::NotFound),
+        Ok(false) => Response::NotFound,
         Err(error) => {
             error!(?error, "organizations.leave.error");
-            Ok(Response::Error(error.to_string()))
+            Response::Error(error.to_string())
         }
     }
 }
