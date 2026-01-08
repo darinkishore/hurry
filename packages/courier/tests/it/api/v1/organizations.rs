@@ -1081,11 +1081,11 @@ async fn rename_organization_as_admin_succeeds(pool: PgPool) -> Result<()> {
     let org_id = fixture.auth.org_acme().as_i64();
     let url = fixture
         .base_url
-        .join(&format!("api/v1/organizations/{org_id}/rename"))?;
+        .join(&format!("api/v1/organizations/{org_id}"))?;
 
     // Alice is an admin of Acme, so she should be able to rename it
     let response = reqwest::Client::new()
-        .post(url)
+        .patch(url)
         .bearer_auth(fixture.auth.session_alice().expose())
         .json(&RenameOrganizationRequest {
             name: String::from("Acme Renamed"),
@@ -1104,11 +1104,11 @@ async fn rename_organization_as_member_forbidden(pool: PgPool) -> Result<()> {
     let org_id = fixture.auth.org_acme().as_i64();
     let url = fixture
         .base_url
-        .join(&format!("api/v1/organizations/{org_id}/rename"))?;
+        .join(&format!("api/v1/organizations/{org_id}"))?;
 
     // Bob is a member (not admin) of Acme, so he should get 403 Forbidden
     let response = reqwest::Client::new()
-        .post(url)
+        .patch(url)
         .bearer_auth(fixture.auth.session_bob().expose())
         .json(&RenameOrganizationRequest {
             name: String::from("Bob's Rename Attempt"),
@@ -1127,11 +1127,11 @@ async fn rename_organization_as_non_member_forbidden(pool: PgPool) -> Result<()>
     let org_id = fixture.auth.org_acme().as_i64();
     let url = fixture
         .base_url
-        .join(&format!("api/v1/organizations/{org_id}/rename"))?;
+        .join(&format!("api/v1/organizations/{org_id}"))?;
 
     // Charlie is not a member of Acme, so he should get 403 Forbidden
     let response = reqwest::Client::new()
-        .post(url)
+        .patch(url)
         .bearer_auth(fixture.auth.session_charlie().expose())
         .json(&RenameOrganizationRequest {
             name: String::from("Charlie's Rename Attempt"),
@@ -1150,11 +1150,11 @@ async fn rename_organization_empty_name_fails(pool: PgPool) -> Result<()> {
     let org_id = fixture.auth.org_acme().as_i64();
     let url = fixture
         .base_url
-        .join(&format!("api/v1/organizations/{org_id}/rename"))?;
+        .join(&format!("api/v1/organizations/{org_id}"))?;
 
     // Even as admin, empty name should fail with 400 Bad Request
     let response = reqwest::Client::new()
-        .post(url)
+        .patch(url)
         .bearer_auth(fixture.auth.session_alice().expose())
         .json(&RenameOrganizationRequest {
             name: String::from("   "),
