@@ -134,8 +134,8 @@ impl Disk {
         // This isn't _ideal_ because we want to split these prefixes into
         // subfolders for performance reasons, but at least the server doesn't
         // crash or malform the path or something.
-        let prefix1 = hex.get(0..2).unwrap_or("");
-        let prefix2 = hex.get(2..4).unwrap_or("");
+        let prefix1 = hex.get(0..2).unwrap_or_default();
+        let prefix2 = hex.get(2..4).unwrap_or_default();
         self.root.join(prefix1).join(prefix2).join(&hex)
     }
 
