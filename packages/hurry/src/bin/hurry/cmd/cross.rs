@@ -11,7 +11,7 @@ mod build;
 #[derive(Parser)]
 struct CommandOptions<T: Args> {
     #[clap(flatten)]
-    opts: T,
+    inner: T,
 }
 
 impl<T: Args> CommandOptions<T> {
@@ -20,7 +20,7 @@ impl<T: Args> CommandOptions<T> {
     }
 
     fn into_inner(self) -> T {
-        self.opts
+        self.inner
     }
 }
 
@@ -59,8 +59,9 @@ pub async fn exec(arguments: Vec<String>) -> Result<()> {
     // statement with other functions similar to the one we use for `build`.
     match command.as_str() {
         "build" | "b" => {
-            let opts = CommandOptions::<build::Options>::parse(&arguments)?;
-            if opts.opts.help {
+            let wrapper = CommandOptions::<build::Options>::parse(&arguments)?;
+            let opts = wrapper.into_inner();
+            if opts.shared.help {
                 // Help flag handling happens here because `build --help` passes
                 // through to `cross build --help`, and we need the `Command`
                 // struct in order to print the generated help text.
@@ -69,7 +70,7 @@ pub async fn exec(arguments: Vec<String>) -> Result<()> {
                 cmd.print_help()?;
                 return Ok(());
             }
-            build::exec(opts.into_inner()).await
+            build::exec(opts).await
         }
         _ => cross::invoke(command, options).await,
     }
