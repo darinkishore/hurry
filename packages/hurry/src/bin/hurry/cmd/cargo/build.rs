@@ -13,19 +13,17 @@ use color_eyre::{
 };
 use derive_more::Debug;
 use tracing::{debug, info, instrument, trace, warn};
-use url::Url;
 use uuid::Uuid;
 
-use clients::Token;
 use hurry::{
     cargo::{self, CargoBuildArguments, CargoCache, Workspace},
     daemon::{CargoUploadStatus, CargoUploadStatusRequest, CargoUploadStatusResponse, DaemonPaths},
     progress::TransferBar,
 };
 
+use crate::cmd::HurryOptions;
+
 /// Options for `cargo build`.
-//
-// Hurry options are prefixed with `hurry-` to disambiguate from `cargo` args.
 //
 // TODO: When we implemented passthrough support for subcommands, we hid the `hurry` help
 // documentation in favor of showing users Cargo's documentation; this was done in order to make it
@@ -36,49 +34,9 @@ use hurry::{
 #[derive(Clone, Args, Debug)]
 #[command(disable_help_flag = true)]
 pub struct Options {
-    /// Base URL for the Hurry API.
-    #[arg(
-        long = "hurry-api-url",
-        env = "HURRY_API_URL",
-        default_value = "https://app.hurry.build"
-    )]
-    #[debug("{api_url}")]
-    api_url: Url,
-
-    /// Authentication token for the Hurry API.
-    // Note: this field is not _actually_ optional for `hurry` to operate; we're just telling clap
-    // that it is so that if the user runs with the `-h` or `--help` arguments we can not require
-    // the token in that case.
-    #[arg(long = "hurry-api-token", env = "HURRY_API_TOKEN")]
-    api_token: Option<Token>,
-
-    /// Skip backing up the cache.
-    #[arg(long = "hurry-skip-backup", default_value_t = false)]
-    skip_backup: bool,
-
-    /// Skip the Cargo build, only performing the cache actions.
-    #[arg(long = "hurry-skip-build", default_value_t = false)]
-    skip_build: bool,
-
-    /// Skip restoring the cache.
-    #[arg(long = "hurry-skip-restore", default_value_t = false)]
-    skip_restore: bool,
-
-    /// Upload artifacts asynchronously in the background instead of waiting.
-    ///
-    /// By default, hurry waits for uploads to complete before exiting.
-    /// Use this flag to upload in the background and exit immediately after the
-    /// build.
-    #[arg(
-        long = "hurry-async-upload",
-        env = "HURRY_ASYNC_UPLOAD",
-        default_value_t = false
-    )]
-    async_upload: bool,
-
-    /// Show help for `hurry cargo build`.
-    #[arg(long = "hurry-help", default_value_t = false)]
-    pub help: bool,
+    /// Shared Hurry options.
+    #[clap(flatten)]
+    pub hurry: HurryOptions,
 
     /// These arguments are passed directly to `cargo build` as provided.
     #[arg(
@@ -95,6 +53,11 @@ impl Options {
     #[instrument(name = "Options::parsed_args")]
     pub fn parsed_args(&self) -> CargoBuildArguments {
         CargoBuildArguments::from_iter(&self.argv)
+    }
+
+    /// Check if `--hurry-help` was requested.
+    pub fn hurry_help(&self) -> bool {
+        self.hurry.help
     }
 
     /// Check if help is requested in the arguments.
@@ -114,7 +77,7 @@ pub async fn exec(options: Options) -> Result<()> {
 
     // We make the API token required here; if we make it required in the actual
     // clap state then we aren't able to support e.g. `cargo build -h` passthrough.
-    let Some(token) = &options.api_token else {
+    let Some(token) = &options.hurry.api_token else {
         return Err(eyre!("Hurry API authentication token is required"))
             .suggestion("Set the `HURRY_API_TOKEN` environment variable")
             .suggestion("Provide it with the `--hurry-api-token` argument");
@@ -142,13 +105,13 @@ pub async fn exec(options: Options) -> Result<()> {
         .context("calculating expected units")?;
 
     // Initialize cache.
-    let cache = CargoCache::open(options.api_url, token.clone(), workspace)
+    let cache = CargoCache::open(options.hurry.api_url, token.clone(), workspace)
         .await
         .context("opening cache")?;
 
     // Restore artifacts.
     let unit_count = units.len() as u64;
-    let restored = if !options.skip_restore {
+    let restored = if !options.hurry.skip_restore {
         let progress = TransferBar::new(unit_count, "Restoring cache");
         cache.restore(&units, &progress).await?
     } else {
@@ -156,7 +119,7 @@ pub async fn exec(options: Options) -> Result<()> {
     };
 
     // Run the build.
-    if !options.skip_build {
+    if !options.hurry.skip_build {
         info!("Building target directory");
 
         // There are two integration points here that we specifically do _not_
@@ -233,9 +196,9 @@ pub async fn exec(options: Options) -> Result<()> {
     }
 
     // Cache the built artifacts.
-    if !options.skip_backup {
+    if !options.hurry.skip_backup {
         let upload_id = cache.save(units, restored).await?;
-        if !options.async_upload {
+        if !options.hurry.async_upload {
             let progress = TransferBar::new(unit_count, "Uploading cache");
             wait_for_upload(upload_id, &progress).await?;
         }
