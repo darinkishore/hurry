@@ -47,8 +47,18 @@ pub struct Options {
     api_url: Url,
 
     /// Authentication token for the Hurry API.
+    ///
+    /// Required for remote caching. Not required when using `--hurry-local`.
     #[arg(long = "hurry-api-token", env = "HURRY_API_TOKEN")]
     api_token: Option<Token>,
+
+    /// Use local cache instead of remote Courier server.
+    ///
+    /// When enabled, hurry stores build artifacts locally in ~/.cache/hurry/
+    /// (or $HURRY_CACHE_DIR if set) instead of uploading to a remote server.
+    /// This is useful for solo developers who don't need distributed caching.
+    #[arg(long = "hurry-local", env = "HURRY_LOCAL", default_value_t = false)]
+    local_mode: bool,
 
     /// Skip backing up the cache.
     #[arg(long = "hurry-skip-backup", default_value_t = false)]
@@ -112,15 +122,18 @@ pub async fn exec(options: Options) -> Result<()> {
         return cargo::invoke("check", &options.argv).await;
     }
 
-    // We make the API token required here; if we make it required in the actual
-    // clap state then we aren't able to support e.g. `cargo check -h` passthrough.
-    let Some(token) = &options.api_token else {
+    // Validate API token for remote mode.
+    if !options.local_mode && options.api_token.is_none() {
         return Err(eyre!("Hurry API authentication token is required"))
             .suggestion("Set the `HURRY_API_TOKEN` environment variable")
-            .suggestion("Provide it with the `--hurry-api-token` argument");
-    };
+            .suggestion("Provide it with the `--hurry-api-token` argument")
+            .suggestion("Or use `--hurry-local` for local-only caching");
+    }
 
-    info!("Starting check");
+    info!(
+        "Starting check ({})",
+        if options.local_mode { "local mode" } else { "remote mode" }
+    );
 
     // Parse and validate cargo check arguments.
     let args = options.parsed_args();
@@ -145,10 +158,15 @@ pub async fn exec(options: Options) -> Result<()> {
         .await
         .context("calculating expected units")?;
 
-    // Initialize cache.
-    let cache = CargoCache::open(options.api_url, token.clone(), workspace)
-        .await
-        .context("opening cache")?;
+    // Initialize cache based on mode.
+    let cache = if options.local_mode {
+        CargoCache::open_local(workspace).context("opening local cache")?
+    } else {
+        let token = options.api_token.as_ref().expect("token validated above");
+        CargoCache::open_remote(options.api_url, token.clone(), workspace)
+            .await
+            .context("opening remote cache")?
+    };
 
     // Restore artifacts.
     let unit_count = units.len() as u64;
@@ -171,7 +189,8 @@ pub async fn exec(options: Options) -> Result<()> {
     // Cache the checked artifacts.
     if !options.skip_backup {
         let upload_id = cache.save(units, restored).await?;
-        if !options.async_upload {
+        // For local mode, saves are synchronous (no daemon), so no need to wait.
+        if !cache.is_local() && !options.async_upload {
             let progress = TransferBar::new(unit_count, "Uploading cache");
             wait_for_upload(upload_id, &progress).await?;
         }
