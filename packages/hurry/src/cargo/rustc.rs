@@ -220,23 +220,19 @@ impl RustcArguments {
     }
 
     /// The path to the source file being compiled.
+    ///
+    /// When `RUSTC_WRAPPER` is set (e.g., sccache), the args array includes the
+    /// rustc binary path as the first positional argument. We handle this by
+    /// finding the positional argument that ends in `.rs`.
     pub fn src_path(&self) -> &str {
-        let positional_arguments = self
-            .0
+        self.0
             .iter()
             .filter_map(|arg| match arg {
                 RustcArgument::Positional(p) => Some(p.as_str()),
                 _ => None,
             })
-            .collect::<Vec<_>>();
-        debug_assert_eq!(
-            positional_arguments.len(),
-            1,
-            "expected one rustc positional argument"
-        );
-        positional_arguments
-            .first()
-            .expect("rustc arguments should have one positional argument")
+            .find(|p| p.ends_with(".rs"))
+            .expect("rustc arguments should have a .rs source file")
     }
 
     /// Find the `-C extra-filename` flag value if specified.

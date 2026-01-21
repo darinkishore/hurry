@@ -17,7 +17,6 @@ use uuid::Uuid;
 use crate::{
     cache::{CacheBackend, LocalBackend},
     cargo::{QualifiedPath, UnitPlan, Workspace, host_glibc_version},
-    path::JoinWith as _,
     cas::CourierCas,
     daemon::{CargoUploadRequest, DaemonPaths},
     progress::TransferBar,
@@ -385,43 +384,28 @@ impl CargoCache {
 
     /// Restore units from local storage.
     ///
-    /// For now, this performs a simplified restore that only checks which units
-    /// are already present on disk. Full local cache restore (downloading from
-    /// local CAS) is a future enhancement.
+    /// For now, this is a no-op that just updates the progress bar. Full local
+    /// cache restore (downloading from local CAS + SQLite metadata) is a future
+    /// enhancement.
+    ///
+    /// Note: We intentionally return an empty `Restored` so that `save_local`
+    /// will save all newly built units. If we marked units as "restored" just
+    /// because their fingerprint files exist on disk (from previous non-hurry
+    /// builds), we'd skip saving them to the local cache.
     async fn restore_local(
         &self,
         _backend: &LocalBackend,
         units: &[UnitPlan],
         progress: &TransferBar,
     ) -> Result<Restored> {
-        info!("Checking local cache for existing units");
+        info!("Checking local cache (restore not yet implemented)");
 
-        let restored = Restored::default();
+        // Just update progress for now.
+        progress.inc(units.len() as u64);
 
-        // Check which units are already on disk.
-        for unit in units {
-            let info = unit.info();
-            let fingerprint_file = self
-                .ws
-                .unit_profile_dir(info)
-                .join(unit.fingerprint_json_file()?);
-
-            if crate::fs::exists(&fingerprint_file).await {
-                tracing::debug!(
-                    unit_hash = ?info.unit_hash,
-                    pkg_name = %info.package_name,
-                    "unit already present locally"
-                );
-                restored.units.insert(info.unit_hash.clone());
-            }
-            progress.inc(1);
-        }
-
-        // TODO: Implement full local cache restore (fetch from local CAS +
-        // SQLite metadata). For now, local mode relies on builds being present
-        // on disk from previous runs.
-
-        Ok(restored)
+        // Return empty - we'll save everything after the build.
+        // TODO: Implement actual restore from local CAS + SQLite.
+        Ok(Restored::default())
     }
 }
 
