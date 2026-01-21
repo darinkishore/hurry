@@ -580,14 +580,25 @@ impl Workspace {
             } else if invocation.target_kind == [TargetKind::Bin] {
                 // Binaries are _always_ first-party code. Do nothing for now.
                 continue;
+            } else if invocation.target_kind.contains(&TargetKind::Test)
+                || invocation.target_kind.contains(&TargetKind::Bench)
+                || invocation.target_kind.contains(&TargetKind::Example)
+            {
+                // Test, bench, and example targets are first-party code.
+                // Skip them - they're not cached.
+                trace!("skipping: test/bench/example target kind");
+                continue;
             } else if invocation.target_kind.contains(&TargetKind::Lib)
                 || invocation.target_kind.contains(&TargetKind::RLib)
                 || invocation.target_kind.contains(&TargetKind::CDyLib)
                 || invocation.target_kind.contains(&TargetKind::ProcMacro)
             {
                 // Sanity check: everything here should be a dependency being
-                // compiled.
-                if invocation.compile_mode != CargoCompileMode::Build {
+                // compiled or checked.
+                if !matches!(
+                    invocation.compile_mode,
+                    CargoCompileMode::Build | CargoCompileMode::Check
+                ) {
                     bail!(
                         "unknown compile mode for dependency: {:?}",
                         invocation.compile_mode
@@ -641,7 +652,13 @@ impl Workspace {
                     outputs,
                 })
             } else {
-                bail!("unsupported target kind: {:?}", invocation.target_kind);
+                // Skip unsupported target kinds (e.g., future Cargo additions)
+                // rather than failing. This allows forward compatibility.
+                trace!(
+                    ?invocation.target_kind,
+                    "skipping: unsupported target kind"
+                );
+                continue;
             };
             units.push(unit);
         }

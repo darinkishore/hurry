@@ -6,6 +6,9 @@ use hurry::cargo;
 use tracing::debug;
 
 pub mod build;
+pub mod check;
+pub mod clippy;
+pub mod test;
 
 /// Helper type for parsing options with `clap`.
 #[derive(Parser)]
@@ -68,6 +71,36 @@ pub async fn exec(arguments: Vec<String>) -> Result<()> {
                 return Ok(());
             }
             build::exec(opts.into_inner()).await
+        }
+        "check" | "c" => {
+            let opts: CommandOptions<check::Options> = CommandOptions::parse(&arguments)?;
+            if opts.opts.help {
+                let mut cmd = CommandOptions::<check::Options>::command();
+                cmd = cmd.about("Run `cargo check` with Hurry build acceleration");
+                cmd.print_help()?;
+                return Ok(());
+            }
+            check::exec(opts.into_inner()).await
+        }
+        "test" | "t" => {
+            let opts: CommandOptions<test::Options> = CommandOptions::parse(&arguments)?;
+            if opts.opts.help {
+                let mut cmd = CommandOptions::<test::Options>::command();
+                cmd = cmd.about("Run `cargo test` with Hurry build acceleration");
+                cmd.print_help()?;
+                return Ok(());
+            }
+            test::exec(opts.into_inner()).await
+        }
+        "clippy" => {
+            let opts: CommandOptions<clippy::Options> = CommandOptions::parse(&arguments)?;
+            if opts.opts.help {
+                let mut cmd = CommandOptions::<clippy::Options>::command();
+                cmd = cmd.about("Run `cargo clippy` with Hurry build acceleration");
+                cmd.print_help()?;
+                return Ok(());
+            }
+            clippy::exec(opts.into_inner()).await
         }
         _ => cargo::invoke(command, options).await,
     }

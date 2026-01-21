@@ -1,0 +1,277 @@
+//! Runs Cargo test with an optimized cache.
+//!
+//! Test mode uses a two-phase execution:
+//!
+//! 1. **Compile phase**: Run `cargo test --no-run` to compile test binaries
+//!    - Try to restore from cache first
+//!    - After compilation, save artifacts to cache
+//!
+//! 2. **Execute phase**: Run `cargo test` to execute the tests
+//!    - This runs tests with full output
+//!    - Cache is already saved, so test failures don't lose cache
+//!
+//! This ensures that cache is saved even if tests fail, since we save after
+//! compilation but before execution.
+//!
+//! Reference:
+//! - `docs/DESIGN.md`
+//! - `docs/development/cargo.md`
+
+use std::time::Duration;
+
+use clap::Args;
+use color_eyre::{
+    Result, Section as _, SectionExt as _,
+    eyre::{Context, OptionExt as _, bail, eyre},
+};
+use derive_more::Debug;
+use tracing::{debug, info, instrument, trace, warn};
+use url::Url;
+use uuid::Uuid;
+
+use clients::Token;
+use hurry::{
+    cargo::{self, CargoBuildArguments, CargoCache, Workspace},
+    daemon::{CargoUploadStatus, CargoUploadStatusRequest, CargoUploadStatusResponse, DaemonPaths},
+    progress::TransferBar,
+};
+
+/// Options for `cargo test`.
+///
+/// Hurry options are prefixed with `hurry-` to disambiguate from `cargo` args.
+#[derive(Clone, Args, Debug)]
+#[command(disable_help_flag = true)]
+pub struct Options {
+    /// Base URL for the Hurry API.
+    #[arg(
+        long = "hurry-api-url",
+        env = "HURRY_API_URL",
+        default_value = "https://app.hurry.build"
+    )]
+    #[debug("{api_url}")]
+    api_url: Url,
+
+    /// Authentication token for the Hurry API.
+    #[arg(long = "hurry-api-token", env = "HURRY_API_TOKEN")]
+    api_token: Option<Token>,
+
+    /// Skip backing up the cache.
+    #[arg(long = "hurry-skip-backup", default_value_t = false)]
+    skip_backup: bool,
+
+    /// Skip the Cargo test compilation and execution, only performing the cache actions.
+    #[arg(long = "hurry-skip-test", default_value_t = false)]
+    skip_test: bool,
+
+    /// Skip restoring the cache.
+    #[arg(long = "hurry-skip-restore", default_value_t = false)]
+    skip_restore: bool,
+
+    /// Upload artifacts asynchronously in the background instead of waiting.
+    ///
+    /// By default, hurry waits for uploads to complete before exiting.
+    /// Use this flag to upload in the background and exit immediately after the
+    /// test.
+    #[arg(
+        long = "hurry-async-upload",
+        env = "HURRY_ASYNC_UPLOAD",
+        default_value_t = false
+    )]
+    async_upload: bool,
+
+    /// Show help for `hurry cargo test`.
+    #[arg(long = "hurry-help", default_value_t = false)]
+    pub help: bool,
+
+    /// These arguments are passed directly to `cargo test` as provided.
+    #[arg(
+        num_args = ..,
+        trailing_var_arg = true,
+        allow_hyphen_values = true,
+        value_name = "ARGS",
+    )]
+    argv: Vec<String>,
+}
+
+impl Options {
+    /// Parse the cargo build arguments.
+    ///
+    /// Note: We reuse CargoBuildArguments since test accepts similar args.
+    #[instrument(name = "Options::parsed_args")]
+    pub fn parsed_args(&self) -> CargoBuildArguments {
+        CargoBuildArguments::from_iter(&self.argv)
+    }
+
+    /// Check if help is requested in the arguments.
+    pub fn is_help_request(&self) -> bool {
+        self.argv
+            .iter()
+            .any(|arg| matches!(arg.as_str(), "--help" | "-h"))
+    }
+
+    /// Check if --no-run is already in the arguments.
+    pub fn has_no_run(&self) -> bool {
+        self.argv.iter().any(|arg| arg == "--no-run")
+    }
+}
+
+#[instrument]
+pub async fn exec(options: Options) -> Result<()> {
+    // If help is requested, passthrough directly to cargo to show cargo's help
+    if options.is_help_request() {
+        return cargo::invoke("test", &options.argv).await;
+    }
+
+    // We make the API token required here; if we make it required in the actual
+    // clap state then we aren't able to support e.g. `cargo test -h` passthrough.
+    let Some(token) = &options.api_token else {
+        return Err(eyre!("Hurry API authentication token is required"))
+            .suggestion("Set the `HURRY_API_TOKEN` environment variable")
+            .suggestion("Provide it with the `--hurry-api-token` argument");
+    };
+
+    info!("Starting test");
+
+    // Parse and validate cargo test arguments.
+    let args = options.parsed_args();
+    debug!(?args, "parsed cargo test arguments");
+
+    // Open workspace.
+    let workspace = Workspace::from_argv(&args)
+        .await
+        .context("opening workspace")?;
+    debug!(?workspace, "opened workspace");
+
+    // Compute expected unit plans using the build plan.
+    // Note: This gives us build-mode units. Test compilation produces different
+    // artifacts with different hashes, but the cache will store whatever is
+    // actually produced.
+    let units = workspace
+        .units(&args)
+        .await
+        .context("calculating expected units")?;
+
+    // Initialize cache.
+    let cache = CargoCache::open(options.api_url.clone(), token.clone(), workspace)
+        .await
+        .context("opening cache")?;
+
+    // Restore artifacts.
+    let unit_count = units.len() as u64;
+    let restored = if !options.skip_restore {
+        let progress = TransferBar::new(unit_count, "Restoring cache");
+        cache.restore(&units, &progress).await?
+    } else {
+        Default::default()
+    };
+
+    // Run the test in two phases if we're caching.
+    // Phase 1: Compile test binaries (without running) if we want to cache
+    // before test execution
+    let use_two_phase = !options.skip_test && !options.has_no_run() && !options.skip_backup;
+
+    if use_two_phase {
+        info!("Compiling test binaries");
+
+        // Build args for --no-run compilation
+        let mut compile_args = options.argv.clone();
+        compile_args.push(String::from("--no-run"));
+
+        cargo::invoke("test", &compile_args)
+            .await
+            .context("compile tests with cargo")?;
+
+        // Cache the compiled artifacts after successful compilation.
+        let upload_id = cache.save(units, restored).await?;
+        if !options.async_upload {
+            let progress = TransferBar::new(unit_count, "Uploading cache");
+            wait_for_upload(upload_id, &progress).await?;
+        }
+
+        // Phase 2: Run the tests
+        info!("Running tests");
+        cargo::invoke("test", &options.argv)
+            .await
+            .context("run tests with cargo")?;
+    } else {
+        // Single-phase execution: either we're skipping test, have --no-run,
+        // or are skipping backup.
+        if !options.skip_test {
+            info!("Running cargo test");
+            cargo::invoke("test", &options.argv)
+                .await
+                .context("test with cargo")?;
+        }
+
+        // Cache after test (or if test skipped but backup not skipped)
+        if !options.skip_backup {
+            let upload_id = cache.save(units, restored).await?;
+            if !options.async_upload {
+                let progress = TransferBar::new(unit_count, "Uploading cache");
+                wait_for_upload(upload_id, &progress).await?;
+            }
+        }
+    }
+
+    Ok(())
+}
+
+#[instrument]
+async fn wait_for_upload(request_id: Uuid, progress: &TransferBar) -> Result<()> {
+    let paths = DaemonPaths::initialize().await?;
+    let Some(daemon) = paths.daemon_running().await? else {
+        bail!("daemon is not running");
+    };
+
+    let client = reqwest::Client::default();
+    let endpoint = format!("http://{}/api/v0/cargo/status", daemon.url);
+    let request = CargoUploadStatusRequest { request_id };
+    let mut interval = tokio::time::interval(Duration::from_secs(1));
+
+    let mut last_uploaded_artifacts = 0u64;
+    let mut last_uploaded_files = 0u64;
+    let mut last_uploaded_bytes = 0u64;
+    let mut last_total_artifacts = 0u64;
+    loop {
+        interval.tick().await;
+        trace!(?request, "submitting upload status request");
+        let response = client
+            .post(&endpoint)
+            .json(&request)
+            .send()
+            .await
+            .with_context(|| format!("send upload status request to daemon at: {endpoint}"))
+            .with_section(|| format!("{daemon:?}").header("Daemon context:"))?;
+        trace!(?response, "got upload status response");
+        let response = response.json::<CargoUploadStatusResponse>().await?;
+        trace!(?response, "parsed upload status response");
+        let status = response.status.ok_or_eyre("no upload status")?;
+        match status {
+            CargoUploadStatus::Complete => break,
+            CargoUploadStatus::InProgress(save_progress) => {
+                progress.add_bytes(
+                    save_progress
+                        .uploaded_bytes
+                        .saturating_sub(last_uploaded_bytes),
+                );
+                last_uploaded_bytes = save_progress.uploaded_bytes;
+                progress.add_files(
+                    save_progress
+                        .uploaded_files
+                        .saturating_sub(last_uploaded_files),
+                );
+                last_uploaded_files = save_progress.uploaded_files;
+                progress.inc(
+                    save_progress
+                        .uploaded_units
+                        .saturating_sub(last_uploaded_artifacts),
+                );
+                last_uploaded_artifacts = save_progress.uploaded_units;
+                progress.dec_length(last_total_artifacts.saturating_sub(save_progress.total_units));
+                last_total_artifacts = save_progress.total_units;
+            }
+        }
+    }
+
+    Ok(())
+}
