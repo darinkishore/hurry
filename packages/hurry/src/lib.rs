@@ -4,6 +4,7 @@
 //! that configuration. It's only a library to enable sharing code in `hurry`
 //! with benchmarks and integration tests in the `hurry` repository.
 
+pub mod cache;
 pub mod cargo;
 pub mod cas;
 pub mod cross;
