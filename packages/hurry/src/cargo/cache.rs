@@ -5,27 +5,35 @@
 //! - **Remote mode**: Uses the Courier HTTP API with background daemon uploads
 //! - **Local mode**: Uses local filesystem + SQLite storage (no network required)
 
-use std::{process::Stdio, time::Duration};
+use std::{
+    collections::{HashMap, HashSet},
+    process::Stdio,
+    time::{Duration, SystemTime},
+};
 
 use color_eyre::{Result, Section, SectionExt, eyre::Context as _};
 use derive_more::Debug;
 use serde::{Deserialize, Serialize};
-use tracing::{info, instrument, trace};
+use tracing::{debug, info, instrument, trace, warn};
 use url::Url;
 use uuid::Uuid;
 
 use crate::{
     cache::{CacheBackend, LocalBackend},
-    cargo::{QualifiedPath, UnitPlan, Workspace, host_glibc_version},
+    cargo::{self, Fingerprint, QualifiedPath, UnitHash, UnitPlan, Workspace, host_glibc_version},
     cas::CourierCas,
     daemon::{CargoUploadRequest, DaemonPaths},
+    fs,
+    path::JoinWith as _,
     progress::TransferBar,
 };
+use clients::courier::v1::SavedUnit;
 use clients::{Courier, Token};
 
 mod restore;
 mod save;
 
+use restore::filter_units_with_incomplete_deps;
 pub use restore::{Restored, restore_units};
 pub use save::{SaveProgress, save_units};
 
@@ -116,9 +124,7 @@ impl CargoCache {
                 self.save_remote(url.clone(), token.clone(), units, restored)
                     .await
             }
-            CacheBackendMode::Local { backend } => {
-                self.save_local(backend, units, restored).await
-            }
+            CacheBackendMode::Local { backend } => self.save_local(backend, units, restored).await,
         }
     }
 
@@ -242,8 +248,7 @@ impl CargoCache {
                     }
 
                     let dep_info_contents = serde_json::to_vec(&files.dep_info_file)?;
-                    let dep_info_key =
-                        clients::courier::v1::Key::from_buffer(&dep_info_contents);
+                    let dep_info_key = clients::courier::v1::Key::from_buffer(&dep_info_contents);
                     if !skip.files.contains(&dep_info_key) {
                         backend.cas_store(&dep_info_key, &dep_info_contents).await?;
                     }
@@ -280,8 +285,7 @@ impl CargoCache {
                     }
 
                     let dep_info_contents = serde_json::to_vec(&files.dep_info_file)?;
-                    let dep_info_key =
-                        clients::courier::v1::Key::from_buffer(&dep_info_contents);
+                    let dep_info_key = clients::courier::v1::Key::from_buffer(&dep_info_contents);
                     if !skip.files.contains(&dep_info_key) {
                         backend.cas_store(&dep_info_key, &dep_info_contents).await?;
                     }
@@ -384,28 +388,389 @@ impl CargoCache {
 
     /// Restore units from local storage.
     ///
-    /// For now, this is a no-op that just updates the progress bar. Full local
-    /// cache restore (downloading from local CAS + SQLite metadata) is a future
-    /// enhancement.
-    ///
-    /// Note: We intentionally return an empty `Restored` so that `save_local`
-    /// will save all newly built units. If we marked units as "restored" just
-    /// because their fingerprint files exist on disk (from previous non-hurry
-    /// builds), we'd skip saving them to the local cache.
+    /// Queries SQLite for cached units, fetches files from local CAS, and writes
+    /// them to the target directory with proper fingerprint rewriting.
     async fn restore_local(
         &self,
-        _backend: &LocalBackend,
+        backend: &LocalBackend,
         units: &[UnitPlan],
         progress: &TransferBar,
     ) -> Result<Restored> {
-        info!("Checking local cache (restore not yet implemented)");
+        info!("Restoring from local cache");
 
-        // Just update progress for now.
-        progress.inc(units.len() as u64);
+        let restored = Restored::default();
 
-        // Return empty - we'll save everything after the build.
-        // TODO: Implement actual restore from local CAS + SQLite.
-        Ok(Restored::default())
+        // Check which units are already on disk, and don't attempt to restore them.
+        let mut units_to_skip = HashSet::new();
+        for unit in units {
+            let info = unit.info();
+            if fs::exists(
+                &self
+                    .ws
+                    .unit_profile_dir(info)
+                    .join(unit.fingerprint_json_file()?),
+            )
+            .await
+            {
+                units_to_skip.insert(info.unit_hash.clone());
+                debug!(
+                    unit_hash = ?info.unit_hash,
+                    pkg_name = %info.package_name,
+                    "skipping unit: already fresh locally"
+                );
+                restored.units.insert(info.unit_hash.clone());
+            }
+        }
+
+        // Get host glibc version for compatibility filtering.
+        let host_glibc_symbol_version = host_glibc_version()?;
+        debug!(
+            ?host_glibc_symbol_version,
+            "restore starting with host glibc"
+        );
+
+        // Query all unit hashes (including skipped) to get fingerprint data.
+        // We need fingerprints for skipped units to populate dep_fingerprints.
+        let unit_hashes = units
+            .iter()
+            .map(|u| {
+                clients::courier::v1::SavedUnitHash::new(String::from(u.info().unit_hash.clone()))
+            })
+            .collect::<Vec<_>>();
+
+        let host_glibc_v1 = host_glibc_symbol_version.map(|g| clients::courier::v1::GlibcVersion {
+            major: g.major,
+            minor: g.minor,
+            patch: g.patch,
+        });
+
+        let saved_units_vec = backend.cargo_restore(unit_hashes, host_glibc_v1).await?;
+
+        // Convert to a HashMap for easier lookup.
+        let mut saved_units = saved_units_vec
+            .into_iter()
+            .map(|(hash, unit)| (UnitHash::from(hash.as_str()), unit))
+            .collect::<HashMap<_, _>>();
+
+        info!(
+            requested_count = units.len(),
+            returned_count = saved_units.len(),
+            "local cache restore response"
+        );
+
+        // Filter units with incomplete dependency chains.
+        // Create a temporary CargoRestoreResponse-like structure for the filter function.
+        let saved_units_for_filter = saved_units
+            .iter()
+            .map(|(k, v)| {
+                (
+                    clients::courier::v1::SavedUnitHash::new(String::from(k.clone())),
+                    v.clone(),
+                )
+            })
+            .collect::<clients::courier::v1::cache::CargoRestoreResponse>();
+
+        let (units_with_incomplete_deps, incomplete_deps_count) =
+            filter_units_with_incomplete_deps(units, &saved_units_for_filter, &units_to_skip);
+
+        if incomplete_deps_count > 0 {
+            warn!(
+                incomplete_deps_count,
+                "filtered units with incomplete dependency chains"
+            );
+        }
+
+        // Track fingerprint mappings for rewriting.
+        let mut dep_fingerprints = HashMap::new();
+
+        // Mtime management: start from UNIX_EPOCH to avoid dirtying first-party builds.
+        let starting_mtime = SystemTime::UNIX_EPOCH;
+
+        for (i, unit) in units.iter().enumerate() {
+            let unit_hash = &unit.info().unit_hash;
+
+            // Calculate mtime - increment by 1 second per unit for ordering.
+            let mtime = starting_mtime + Duration::from_secs(i as u64);
+
+            if units_with_incomplete_deps.contains(unit_hash) {
+                progress.dec_length(1);
+                continue;
+            }
+
+            // Get the saved unit from cache.
+            let Some(saved) = saved_units.remove(unit_hash) else {
+                debug!(
+                    ?unit_hash,
+                    pkg_name = %unit.info().package_name,
+                    "unit missing from local cache"
+                );
+
+                // Touch skipped units to maintain mtime invariants.
+                if units_to_skip.contains(unit_hash)
+                    && let Err(err) = unit.touch(&self.ws, starting_mtime).await
+                {
+                    warn!(?unit_hash, ?err, "could not set mtime for skipped unit");
+                }
+                progress.dec_length(1);
+                continue;
+            };
+
+            // Parse the cached fingerprint.
+            let cached_fingerprint = saved.fingerprint().as_str();
+            let cached_fingerprint = serde_json::from_str::<Fingerprint>(cached_fingerprint)?;
+
+            // Handle skipped units - just record fingerprint mapping and touch mtime.
+            if units_to_skip.contains(unit_hash) {
+                let profile = self.ws.unit_profile_dir(unit.info());
+                let cached_hash = cached_fingerprint.hash_u64();
+
+                let file = unit.fingerprint_json_file()?;
+                let file = profile.join(&file);
+                let json = fs::must_read_buffered_utf8(&file).await?;
+                let local = serde_json::from_str::<Fingerprint>(&json)?;
+                let local_hash = local.hash_u64();
+
+                debug!(
+                    ?cached_hash,
+                    ?local_hash,
+                    "recorded fingerprint mapping for skipped unit"
+                );
+
+                dep_fingerprints.insert(cached_hash, local);
+
+                if let Err(err) = unit.touch(&self.ws, mtime).await {
+                    warn!(?unit_hash, ?err, "could not set mtime for skipped unit");
+                }
+                progress.dec_length(1);
+                continue;
+            }
+
+            // Rewrite fingerprint and write it.
+            let info = unit.info();
+            let src_path = unit.src_path().map(|p| p.into());
+            let rewritten_fingerprint =
+                cached_fingerprint.rewrite(src_path, &mut dep_fingerprints)?;
+            let fingerprint_hash = rewritten_fingerprint.fingerprint_hash();
+
+            let profile_dir = self.ws.unit_profile_dir(info);
+            fs::write(
+                &profile_dir.join(&unit.fingerprint_hash_file()?),
+                fingerprint_hash,
+            )
+            .await?;
+            fs::write(
+                &profile_dir.join(&unit.fingerprint_json_file()?),
+                serde_json::to_vec(&rewritten_fingerprint)?,
+            )
+            .await?;
+
+            // Restore files from local CAS based on unit type.
+            match (saved, unit) {
+                (
+                    SavedUnit::LibraryCrate(saved_library_files, _),
+                    UnitPlan::LibraryCrate(unit_plan),
+                ) => {
+                    trace!(
+                        pkg_name = %unit_plan.info.package_name,
+                        unit_hash = %unit_plan.info.unit_hash,
+                        num_output_files = saved_library_files.output_files.len(),
+                        "restoring library crate unit from local cache"
+                    );
+
+                    // Restore output files.
+                    for file in saved_library_files.output_files {
+                        let path: QualifiedPath = serde_json::from_str(file.path.as_str())?;
+                        let path = path.reconstruct(&self.ws, &unit_plan.info).try_into()?;
+
+                        let data = backend.cas_get(&file.object_key).await?.ok_or_else(|| {
+                            color_eyre::eyre::eyre!(
+                                "missing CAS key for output file: {}",
+                                file.object_key
+                            )
+                        })?;
+
+                        fs::write(&path, data).await?;
+                        fs::set_executable(&path, file.executable).await?;
+                        fs::set_mtime(&path, mtime).await?;
+
+                        restored.files.insert(file.object_key);
+                        progress.add_files(1);
+                    }
+
+                    // Restore dep-info file with reconstruction.
+                    let dep_info_data = backend
+                        .cas_get(&saved_library_files.dep_info_file)
+                        .await?
+                        .ok_or_else(|| {
+                            color_eyre::eyre::eyre!("missing CAS key for dep-info file")
+                        })?;
+                    let dep_info: cargo::DepInfo = serde_json::from_slice(&dep_info_data)?;
+                    let dep_info = dep_info.reconstruct(&self.ws, &unit_plan.info);
+                    let path = profile_dir.join(&unit_plan.dep_info_file()?);
+                    fs::write(&path, dep_info).await?;
+                    fs::set_mtime(&path, mtime).await?;
+                    restored.files.insert(saved_library_files.dep_info_file);
+
+                    // Restore encoded dep-info file (no transformation).
+                    let encoded_dep_info_data = backend
+                        .cas_get(&saved_library_files.encoded_dep_info_file)
+                        .await?
+                        .ok_or_else(|| {
+                            color_eyre::eyre::eyre!("missing CAS key for encoded dep-info file")
+                        })?;
+                    let path = profile_dir.join(&unit_plan.encoded_dep_info_file()?);
+                    fs::write(&path, encoded_dep_info_data).await?;
+                    fs::set_mtime(&path, mtime).await?;
+                    restored
+                        .files
+                        .insert(saved_library_files.encoded_dep_info_file);
+                }
+                (
+                    SavedUnit::BuildScriptCompilation(build_script_compiled_files, _),
+                    UnitPlan::BuildScriptCompilation(unit_plan),
+                ) => {
+                    debug!(
+                        pkg_name = %unit_plan.info.package_name,
+                        unit_hash = %unit_plan.info.unit_hash,
+                        "restoring build script compilation unit from local cache"
+                    );
+
+                    // Restore compiled program.
+                    let compiled_data = backend
+                        .cas_get(&build_script_compiled_files.compiled_program)
+                        .await?
+                        .ok_or_else(|| {
+                            color_eyre::eyre::eyre!("missing CAS key for compiled program")
+                        })?;
+
+                    let path = profile_dir.join(unit_plan.program_file()?);
+                    let linked_path = profile_dir.join(unit_plan.linked_program_file()?);
+
+                    fs::write(&path, compiled_data).await?;
+                    fs::set_executable(&path, true).await?;
+                    fs::set_mtime(&path, mtime).await?;
+                    fs::hard_link(&path, &linked_path).await?;
+                    fs::set_mtime(&linked_path, mtime).await?;
+                    restored
+                        .files
+                        .insert(build_script_compiled_files.compiled_program);
+
+                    // Restore dep-info file with reconstruction.
+                    let dep_info_data = backend
+                        .cas_get(&build_script_compiled_files.dep_info_file)
+                        .await?
+                        .ok_or_else(|| {
+                            color_eyre::eyre::eyre!("missing CAS key for dep-info file")
+                        })?;
+                    let dep_info: cargo::DepInfo = serde_json::from_slice(&dep_info_data)?;
+                    let dep_info = dep_info.reconstruct(&self.ws, &unit_plan.info);
+                    let path = profile_dir.join(&unit_plan.dep_info_file()?);
+                    fs::write(&path, dep_info).await?;
+                    fs::set_mtime(&path, mtime).await?;
+                    restored
+                        .files
+                        .insert(build_script_compiled_files.dep_info_file);
+
+                    // Restore encoded dep-info file (no transformation).
+                    let encoded_dep_info_data = backend
+                        .cas_get(&build_script_compiled_files.encoded_dep_info_file)
+                        .await?
+                        .ok_or_else(|| {
+                            color_eyre::eyre::eyre!("missing CAS key for encoded dep-info file")
+                        })?;
+                    let path = profile_dir.join(&unit_plan.encoded_dep_info_file()?);
+                    fs::write(&path, encoded_dep_info_data).await?;
+                    fs::set_mtime(&path, mtime).await?;
+                    restored
+                        .files
+                        .insert(build_script_compiled_files.encoded_dep_info_file);
+                }
+                (
+                    SavedUnit::BuildScriptExecution(build_script_output_files, _),
+                    UnitPlan::BuildScriptExecution(unit_plan),
+                ) => {
+                    let out_dir = unit_plan.out_dir()?;
+                    let out_dir_absolute = profile_dir.join(&out_dir);
+
+                    debug!(
+                        pkg_name = %unit_plan.info.package_name,
+                        unit_hash = %unit_plan.info.unit_hash,
+                        out_dir = %out_dir,
+                        num_out_dir_files = build_script_output_files.out_dir_files.len(),
+                        "restoring build script execution unit from local cache"
+                    );
+
+                    // Create OUT_DIR directory.
+                    fs::create_dir_all(&out_dir_absolute).await?;
+
+                    // Restore all OUT_DIR files.
+                    for file in build_script_output_files.out_dir_files {
+                        let path: QualifiedPath = serde_json::from_str(file.path.as_str())?;
+                        let path = path.reconstruct(&self.ws, &unit_plan.info).try_into()?;
+
+                        let data = backend.cas_get(&file.object_key).await?.ok_or_else(|| {
+                            color_eyre::eyre::eyre!(
+                                "missing CAS key for OUT_DIR file: {}",
+                                file.object_key
+                            )
+                        })?;
+
+                        debug!(
+                            pkg_name = %unit_plan.info.package_name,
+                            file_path = %AsRef::<std::path::Path>::as_ref(&path).display(),
+                            "restoring build script OUT_DIR file"
+                        );
+
+                        fs::write(&path, data).await?;
+                        fs::set_executable(&path, file.executable).await?;
+                        fs::set_mtime(&path, mtime).await?;
+                        restored.files.insert(file.object_key);
+                        progress.add_files(1);
+                    }
+
+                    // Restore stdout with BuildScriptOutput reconstruction.
+                    let stdout_data = backend
+                        .cas_get(&build_script_output_files.stdout)
+                        .await?
+                        .ok_or_else(|| color_eyre::eyre::eyre!("missing CAS key for stdout"))?;
+                    let stdout: cargo::BuildScriptOutput = serde_json::from_slice(&stdout_data)?;
+                    let stdout = stdout.reconstruct(&self.ws, &unit_plan.info);
+                    let path = profile_dir.join(&unit_plan.stdout_file()?);
+                    fs::write(&path, stdout).await?;
+                    fs::set_mtime(&path, mtime).await?;
+                    restored.files.insert(build_script_output_files.stdout);
+
+                    // Restore stderr (no transformation).
+                    let stderr_data = backend
+                        .cas_get(&build_script_output_files.stderr)
+                        .await?
+                        .ok_or_else(|| color_eyre::eyre::eyre!("missing CAS key for stderr"))?;
+                    let path = profile_dir.join(&unit_plan.stderr_file()?);
+                    fs::write(&path, stderr_data).await?;
+                    fs::set_mtime(&path, mtime).await?;
+                    restored.files.insert(build_script_output_files.stderr);
+
+                    // Generate root-output file.
+                    let root_output_path = profile_dir.join(&unit_plan.root_output_file()?);
+                    fs::write(
+                        &root_output_path,
+                        out_dir_absolute.as_os_str().as_encoded_bytes(),
+                    )
+                    .await?;
+                    fs::set_mtime(&root_output_path, mtime).await?;
+                }
+                _ => {
+                    return Err(color_eyre::eyre::eyre!("unit type mismatch"));
+                }
+            }
+
+            // Mark the unit as restored.
+            debug!(?unit, "marking unit as restored");
+            restored.units.insert(unit_hash.clone());
+            progress.inc(1);
+        }
+
+        Ok(restored)
     }
 }
 

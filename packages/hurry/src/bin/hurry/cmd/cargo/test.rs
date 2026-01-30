@@ -142,7 +142,11 @@ pub async fn exec(options: Options) -> Result<()> {
 
     info!(
         "Starting test ({})",
-        if options.local_mode { "local mode" } else { "remote mode" }
+        if options.local_mode {
+            "local mode"
+        } else {
+            "remote mode"
+        }
     );
 
     // Parse and validate cargo test arguments.

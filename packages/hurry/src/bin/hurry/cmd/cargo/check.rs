@@ -132,7 +132,11 @@ pub async fn exec(options: Options) -> Result<()> {
 
     info!(
         "Starting check ({})",
-        if options.local_mode { "local mode" } else { "remote mode" }
+        if options.local_mode {
+            "local mode"
+        } else {
+            "remote mode"
+        }
     );
 
     // Parse and validate cargo check arguments.

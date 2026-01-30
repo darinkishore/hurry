@@ -154,7 +154,12 @@ impl CompilerArtifact {
         // Extract hash suffix after the last hyphen
         let hash = stem.rsplit_once('-').map(|(_, h)| h);
 
-        trace!(?filename, ?stem, ?hash, "extracting unit hash from artifact");
+        trace!(
+            ?filename,
+            ?stem,
+            ?hash,
+            "extracting unit hash from artifact"
+        );
 
         Ok(hash.map(|h| UnitHash::from(h.to_string())))
     }
@@ -341,10 +346,7 @@ mod tests {
 
         // Build scripts have the hash in the directory name, not the filename
         // This test shows the current behavior - we may need to adjust for build scripts
-        pretty_assert_eq!(
-            artifact.unit_hash().unwrap(),
-            Some(UnitHash::from("build"))
-        );
+        pretty_assert_eq!(artifact.unit_hash().unwrap(), Some(UnitHash::from("build")));
         assert!(artifact.is_build_script());
     }
 

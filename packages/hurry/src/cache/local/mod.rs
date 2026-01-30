@@ -88,8 +88,7 @@ impl CacheBackend for LocalBackend {
     #[instrument(name = "LocalBackend::cargo_save", skip_all)]
     async fn cargo_save(
         &self,
-        units: impl IntoIterator<Item = (SavedUnitHash, SavedUnit, String, Option<GlibcVersion>)>
-            + Send,
+        units: impl IntoIterator<Item = (SavedUnitHash, SavedUnit, String, Option<GlibcVersion>)> + Send,
     ) -> Result<()> {
         let metadata = self.metadata.lock().map_err(|e| eyre!("lock error: {e}"))?;
 

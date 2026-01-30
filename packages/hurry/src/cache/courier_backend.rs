@@ -50,8 +50,7 @@ impl CacheBackend for CourierBackend {
     #[instrument(name = "CourierBackend::cargo_save", skip_all)]
     async fn cargo_save(
         &self,
-        units: impl IntoIterator<Item = (SavedUnitHash, SavedUnit, String, Option<GlibcVersion>)>
-            + Send,
+        units: impl IntoIterator<Item = (SavedUnitHash, SavedUnit, String, Option<GlibcVersion>)> + Send,
     ) -> Result<()> {
         let requests = units
             .into_iter()

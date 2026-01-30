@@ -35,8 +35,7 @@ pub trait CacheBackend: Clone + Send + Sync + 'static {
     /// mappings, etc.) so they can be restored later.
     fn cargo_save(
         &self,
-        units: impl IntoIterator<Item = (SavedUnitHash, SavedUnit, String, Option<GlibcVersion>)>
-            + Send,
+        units: impl IntoIterator<Item = (SavedUnitHash, SavedUnit, String, Option<GlibcVersion>)> + Send,
     ) -> impl Future<Output = Result<()>> + Send;
 
     /// Restore cargo build units from the cache.
@@ -78,8 +77,7 @@ pub trait CacheBackend: Clone + Send + Sync + 'static {
     fn cas_get_bulk(
         &self,
         keys: impl IntoIterator<Item = Key> + Send,
-    ) -> impl Future<Output = Result<impl Stream<Item = Result<(Key, Vec<u8>)>> + Send + Unpin>>
-           + Send;
+    ) -> impl Future<Output = Result<impl Stream<Item = Result<(Key, Vec<u8>)>> + Send + Unpin>> + Send;
 }
 
 use std::future::Future;

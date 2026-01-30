@@ -820,6 +820,8 @@ fn unit_type_name(unit: &UnitPlan) -> &'static str {
 
 /// Filter units to only those with complete dependency chains.
 ///
+/// This function is also used by local restore to determine which units can be restored.
+///
 /// When the server returns some units but not their dependencies (e.g., due to
 /// glibc incompatibility), restoring those units will fail during fingerprint
 /// rewriting because the dependency's fingerprint hash mapping is never
@@ -849,7 +851,7 @@ fn unit_type_name(unit: &UnitPlan) -> &'static str {
 /// Returns:
 /// - A set of unit hashes that should be skipped (filtered out)
 /// - The count of units filtered due to incomplete dependencies
-fn filter_units_with_incomplete_deps(
+pub fn filter_units_with_incomplete_deps(
     units: &[UnitPlan],
     saved_units: &CargoRestoreResponse,
     units_to_skip: &HashSet<UnitHash>,
